@@ -81,6 +81,26 @@ const DEFAULT_SETTINGS = {
 
 const tabSessions = new Map();
 const audioTranscriptCache = new Map();
+const deadLocalSttUrls = new Map();
+
+function computeAudioFingerprint(audioRes) {
+  const b64 = String(audioRes?.base64 || "");
+  if (!b64) return "";
+  const len = b64.length;
+  let h1 = 2166136261 >>> 0;
+  let h2 = 0x9e3779b9 >>> 0;
+  const step = Math.max(1, Math.floor(len / 96));
+  for (let i = 0; i < len; i += step) {
+    const end = Math.min(len, i + 12);
+    for (let j = i; j < end; j++) {
+      const code = b64.charCodeAt(j);
+      h1 ^= code;
+      h1 = Math.imul(h1, 16777619) >>> 0;
+      h2 = ((h2 << 5) - h2 + code) >>> 0;
+    }
+  }
+  return `audioHash:${len}:${h1.toString(16)}_${h2.toString(16)}`;
+}
 
 function nowTimeStr() {
   const d = new Date();
@@ -1360,15 +1380,54 @@ async function ensureOffscreenDocument() {
   await creatingOffscreenPromise;
 }
 
-async function isLocalSttServerAlive(localSttUrl, signal) {
+function buildLocalSttUrlCandidates(localSttUrl) {
+  const raw = (localSttUrl || "http://127.0.0.1:8765/inference").trim();
+  const list = [raw];
   try {
-    const raw = (localSttUrl || "http://127.0.0.1:8765/inference").trim();
     const u = new URL(/^https?:\/\//i.test(raw) ? raw : `http://${raw}`);
-    const res = await fetchWithTimeout(`${u.origin}/`, { method: "GET" }, 380, signal);
-    return res.status < 500;
+    if (u.port === "8765" && (u.hostname === "127.0.0.1" || u.hostname === "localhost")) {
+      list.push(`http://${u.hostname}:18765${u.pathname && u.pathname !== "/" ? u.pathname : "/inference"}`);
+    }
+  } catch (_) {}
+  return Array.from(new Set(list));
+}
+
+async function isSingleLocalSttEndpointAlive(urlStr, signal) {
+  try {
+    const u = new URL(/^https?:\/\//i.test(urlStr) ? urlStr : `http://${urlStr}`);
+    const deadUntil = deadLocalSttUrls.get(u.origin) || 0;
+    if (deadUntil > Date.now()) return false;
+
+    const res = await fetchWithTimeout(`${u.origin}/`, { method: "GET" }, 450, signal);
+    if (!res.ok) {
+      if (res.status === 404) {
+        deadLocalSttUrls.set(u.origin, Date.now() + 60000);
+      }
+      return false;
+    }
+    const serverHdr = (res.headers?.get?.("server") || "").toLowerCase();
+    const bodyText = await res.text().catch(() => "");
+    if (serverHdr.includes("whisper") || /whisper/i.test(bodyText) || /"status"\s*:\s*"ok"/i.test(bodyText)) {
+      return true;
+    }
+    deadLocalSttUrls.set(u.origin, Date.now() + 60000);
+    return false;
   } catch (_) {
     return false;
   }
+}
+
+async function findAliveLocalSttUrl(localSttUrl, signal) {
+  for (const cand of buildLocalSttUrlCandidates(localSttUrl)) {
+    if (await isSingleLocalSttEndpointAlive(cand, signal)) {
+      return cand;
+    }
+  }
+  return null;
+}
+
+async function isLocalSttServerAlive(localSttUrl, signal) {
+  return Boolean(await findAliveLocalSttUrl(localSttUrl, signal));
 }
 
 async function ensureWavAudio(audioRes) {
@@ -1396,7 +1455,8 @@ async function ensureWavAudio(audioRes) {
   return audioRes;
 }
 
-async function resolveSttCredentialsAsync(settings, signal) {
+async function resolveSttCredentialsAsync(settings, signal, opts = {}) {
+  const allowLocalServerFallback = opts.allowLocalServerFallback !== false;
   const keys = settings.apiKeysByPreset || {};
   const explicitProvider = settings.sttProvider || "auto";
   const explicitKey = (settings.sttApiKey || "").trim();
@@ -1419,6 +1479,21 @@ async function resolveSttCredentialsAsync(settings, signal) {
     return { provider: "local_browser", modelId: localBrowserModel };
   }
   if (explicitProvider === "local_server") {
+    const aliveUrl = await findAliveLocalSttUrl(localSttUrl, signal);
+    if (aliveUrl) {
+      return {
+        provider: "local_server",
+        url: aliveUrl,
+        fallbackToBrowser: allowLocalServerFallback,
+        browserModelId: localBrowserModel
+      };
+    }
+    if (allowLocalServerFallback) {
+      return {
+        provider: "local_browser",
+        modelId: localBrowserModel
+      };
+    }
     return {
       provider: "local_server",
       url: localSttUrl,
@@ -1460,10 +1535,11 @@ async function resolveSttCredentialsAsync(settings, signal) {
 
   // --- AUTO MODE PRIORITY ---
   // 1. If PC local whisper-server.exe (.bat) is currently running on localhost, use it first (fastest & highest accuracy)!
-  if (await isLocalSttServerAlive(localSttUrl, signal)) {
+  const aliveAutoUrl = await findAliveLocalSttUrl(localSttUrl, signal);
+  if (aliveAutoUrl) {
     return {
       provider: "local_server",
-      url: localSttUrl,
+      url: aliveAutoUrl,
       fallbackToBrowser: true,
       browserModelId: localBrowserModel
     };
@@ -1561,16 +1637,18 @@ function base64ToUint8Array(base64) {
 }
 
 async function transcribeWithLocalServer(serverUrlRaw, audioRes, candidateHint, signal, onProgress) {
-  const raw = (serverUrlRaw || "http://127.0.0.1:8765/inference").trim();
-  const baseObj = new URL(/^https?:\/\//i.test(raw) ? raw : `http://${raw}`);
-  const origin = baseObj.origin;
-  const candidateUrls = Array.from(
-    new Set([
+  const urlCandidatesRaw = buildLocalSttUrlCandidates(serverUrlRaw);
+  const candidateUrls = [];
+  for (const cand of urlCandidatesRaw) {
+    const baseObj = new URL(/^https?:\/\//i.test(cand) ? cand : `http://${cand}`);
+    const origin = baseObj.origin;
+    candidateUrls.push(
       baseObj.pathname && baseObj.pathname !== "/" ? baseObj.href : `${origin}/inference`,
       `${origin}/inference`,
       `${origin}/v1/audio/transcriptions`
-    ])
-  );
+    );
+  }
+  const uniqueEndpoints = Array.from(new Set(candidateUrls));
 
   if (onProgress) await onProgress("PCローカルサーバー変換中");
   const wavAudio = await ensureWavAudio(audioRes);
@@ -1578,7 +1656,10 @@ async function transcribeWithLocalServer(serverUrlRaw, audioRes, candidateHint, 
   const blob = new Blob([bytes], { type: "audio/wav" });
 
   let lastErr = "";
-  for (const endpoint of candidateUrls) {
+  for (const endpoint of uniqueEndpoints) {
+    const epOrigin = new URL(endpoint).origin;
+    if ((deadLocalSttUrls.get(epOrigin) || 0) > Date.now()) continue;
+
     if (onProgress) await onProgress(`PCローカルWhisper`);
     const form = new FormData();
     form.append("file", blob, "audio.wav");
@@ -1597,12 +1678,15 @@ async function transcribeWithLocalServer(serverUrlRaw, audioRes, candidateHint, 
     try {
       res = await fetchWithTimeout(endpoint, { method: "POST", body: form }, 25000, signal);
     } catch (netErr) {
-      lastErr = `PCローカルサーバー (${origin}) に接続できません。local-stt\\2_ローカル音声サーバー起動.bat を起動してください`;
+      lastErr = `PCローカルサーバー (${epOrigin}) に接続できません。local-stt\\2_ローカル音声サーバー起動.bat を起動してください`;
       continue;
     }
 
     if (res.status === 404) {
       lastErr = `404 (${endpoint})`;
+      if (endpoint.endsWith("/v1/audio/transcriptions")) {
+        deadLocalSttUrls.set(epOrigin, Date.now() + 60000);
+      }
       continue;
     }
     if (!res.ok) {
@@ -1610,7 +1694,8 @@ async function transcribeWithLocalServer(serverUrlRaw, audioRes, candidateHint, 
       throw new Error(`PCローカルサーバーエラー (${res.status}): ${errText.slice(0, 140)}`);
     }
 
-    const ct = res.headers.get("content-type") || "";
+    deadLocalSttUrls.delete(epOrigin);
+    const ct = res.headers?.get?.("content-type") || "";
     if (ct.includes("application/json")) {
       const data = await res.json();
       return String(data?.text || "").replace(/\s+/g, " ").trim();
@@ -1626,7 +1711,7 @@ async function transcribeWithLocalServer(serverUrlRaw, audioRes, candidateHint, 
 
   throw new Error(
     lastErr ||
-      `PCローカルサーバー (${origin}) に接続できません。local-stt\\2_ローカル音声サーバー起動.bat を起動してください`
+      "PCローカルサーバーに接続できません。local-stt\\2_ローカル音声サーバー起動.bat を起動してください"
   );
 }
 
@@ -2803,13 +2888,16 @@ async function executeSingleStep(tabId, isAutoMode) {
           if (audioRes?.ok && audioRes.base64) {
             const isRealAudioUrl =
               Boolean(audioRes.url) && !/^webaudio:\/\//i.test(audioRes.url);
-            const existingByUrl = isRealAudioUrl ? audioTranscriptCache.get(audioRes.url) : null;
-            if (existingByUrl) {
-              currentAudioTranscript = existingByUrl;
-              audioTranscriptCache.set(pageCacheKey, existingByUrl);
+            const audioHash = computeAudioFingerprint(audioRes);
+            const existingCached =
+              (isRealAudioUrl ? audioTranscriptCache.get(audioRes.url) : null) ||
+              (audioHash ? audioTranscriptCache.get(audioHash) : null);
+            if (existingCached) {
+              currentAudioTranscript = existingCached;
+              audioTranscriptCache.set(pageCacheKey, existingCached);
               appendLog(
                 session,
-                `AUDIO: 同一音声URLのキャッシュを使用 (${existingByUrl.length}文字)`
+                `AUDIO: 同一音声データのキャッシュを使用 -> Whisperスキップ (${existingCached.length}文字)`
               );
             } else {
               appendLog(
@@ -2832,6 +2920,7 @@ async function executeSingleStep(tabId, isAutoMode) {
               if (transcript) {
                 currentAudioTranscript = transcript;
                 if (isRealAudioUrl) audioTranscriptCache.set(audioRes.url, transcript);
+                if (audioHash) audioTranscriptCache.set(audioHash, transcript);
                 audioTranscriptCache.set(pageCacheKey, transcript);
                 appendLog(
                   session,
@@ -3447,7 +3536,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       case "ELK_TEST_STT": {
         const testSettings = { ...(await getSettings()), ...(message.settings || {}) };
-        const sttCreds = await resolveSttCredentialsAsync(testSettings, null);
+        const sttCreds = await resolveSttCredentialsAsync(testSettings, null, {
+          allowLocalServerFallback: false
+        });
         const lines = [];
         const session = senderTabId ? getOrCreateSession(senderTabId) : null;
 
