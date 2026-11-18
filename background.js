@@ -856,14 +856,72 @@ function installMainWorldAudioHook() {
   } catch (_) {}
 }
 
+const CLE_HOST_RE = /(?:^|\.)cle(?:\.koan)?\.osaka-u\.ac\.jp$/i;
+
+function isCleUrl(url) {
+  try {
+    return CLE_HOST_RE.test(new URL(String(url || "")).hostname);
+  } catch (_) {
+    return false;
+  }
+}
+
+function getContentScriptFilesForUrl(url) {
+  return isCleUrl(url) ? ["hud.js", "adapters/cle.js"] : ["hud.js", "content.js"];
+}
+
+const cleAttemptContexts = new Map();
+
+async function getCleAttemptContext(attemptKey) {
+  if (!attemptKey) return null;
+  if (cleAttemptContexts.has(attemptKey)) {
+    return cleAttemptContexts.get(attemptKey);
+  }
+  try {
+    const res = await chrome.storage?.session?.get?.("elkCleAttemptCtx");
+    const saved = res?.elkCleAttemptCtx?.[attemptKey];
+    if (saved) {
+      cleAttemptContexts.set(attemptKey, saved);
+      return saved;
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function setCleAttemptContext(attemptKey, ctx) {
+  if (!attemptKey || !ctx) return;
+  cleAttemptContexts.set(attemptKey, ctx);
+  try {
+    const res = await chrome.storage?.session?.get?.("elkCleAttemptCtx");
+    const mapObj = res?.elkCleAttemptCtx && typeof res.elkCleAttemptCtx === "object"
+      ? { ...res.elkCleAttemptCtx }
+      : {};
+    mapObj[attemptKey] = ctx;
+    const trimmed = Object.entries(mapObj)
+      .sort((a, b) => (b[1]?.updatedAt || 0) - (a[1]?.updatedAt || 0))
+      .slice(0, 10);
+    await chrome.storage?.session?.set?.({ elkCleAttemptCtx: Object.fromEntries(trimmed) });
+  } catch (_) {}
+}
+
 async function ensureContentScripts(tabId) {
-  await chrome.scripting
-    .executeScript({
-      target: { tabId, allFrames: true },
-      world: "MAIN",
-      func: installMainWorldAudioHook
-    })
-    .catch(() => {});
+  let tabUrl = "";
+  if (typeof chrome?.tabs?.get === "function") {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      tabUrl = tab?.url || "";
+    } catch (_) {}
+  }
+
+  if (!isCleUrl(tabUrl)) {
+    await chrome.scripting
+      .executeScript({
+        target: { tabId, allFrames: true },
+        world: "MAIN",
+        func: installMainWorldAudioHook
+      })
+      .catch(() => {});
+  }
 
   try {
     await chrome.tabs.sendMessage(tabId, { type: "ELK_PING" }, { frameId: 0 });
@@ -872,7 +930,7 @@ async function ensureContentScripts(tabId) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
-        files: ["content.js"]
+        files: getContentScriptFilesForUrl(tabUrl)
       });
       await sleep(150);
       return true;
@@ -2487,6 +2545,24 @@ async function executeSingleStep(tabId, isAutoMode) {
     appendLog(session, `BLOCKS: ${briefBlocks}`);
   }
 
+  // CLE safety stops & autosave sync (never auto-start timed tests or auto-submit graded tests)
+  if (frameData.clePauseReason) {
+    session.phase = frameData.clePauseMessage || "⏸️ CLE: 操作を待機して停止しました";
+    session.lastReason = frameData.clePauseDetail || frameData.clePauseMessage || "";
+    session.lastAnswerSummary =
+      frameData.clePauseReason === "ready_to_submit" ? "全問入力完了（提出確認待ち）" : "";
+    appendLog(session, `CLE PAUSE (${frameData.clePauseReason}): ${session.phase}`);
+    await broadcastStatus(tabId);
+    return { done: true };
+  }
+
+  if (frameData.cleWaitingAutosave) {
+    session.phase = "💾 CLE 自動保存の完了を待機中...";
+    appendLog(session, "CLE WAIT: bb-autosave 完了待機 (550ms)");
+    await broadcastStatus(tabId);
+    return { done: false, customNextDelayMs: 550 };
+  }
+
   // Case C_DASH: Course Dashboard ("フォーカス" / "スタート") -> Pick next uncompleted lesson in Auto mode
   if (frameData.isCourseDashboard) {
     if (frameData.url) {
@@ -3311,6 +3387,41 @@ async function executeSingleStep(tabId, isAutoMode) {
     }
   }
 
+  let cleSavedCtxUsed = false;
+  if (frameData.siteType === "cle" && frameData.cleAttemptKey) {
+    if (frameData.cleOwnPassage || currentAudioTranscript) {
+      await setCleAttemptContext(frameData.cleAttemptKey, {
+        passage: frameData.cleOwnPassage || "",
+        audioUrl: frameData.activeAudioUrl || "",
+        transcript: currentAudioTranscript || "",
+        remainingSpan: Math.max(0, (frameData.cleGroupSpan || 1) - 1),
+        updatedAt: Date.now()
+      });
+    } else if (!frameData.hasAudioPlayer && !frameData.sharedContext) {
+      const savedCtx = await getCleAttemptContext(frameData.cleAttemptKey);
+      const shouldAttachSaved =
+        savedCtx &&
+        (frameData.cleSubQuestionHint?.num >= 2 ||
+          frameData.cleReferencesContext ||
+          (savedCtx.remainingSpan || 0) > 0);
+      if (shouldAttachSaved) {
+        const parts = [];
+        if (savedCtx.passage) parts.push(`【前ページからの継続本文・指示】\n${savedCtx.passage}`);
+        if (savedCtx.transcript) {
+          parts.push(`【前ページからの継続音声文字起こし】\n${savedCtx.transcript}`);
+        }
+        if (parts.length > 0) {
+          frameData.sharedContext = parts.join("\n\n");
+          cleSavedCtxUsed = true;
+          appendLog(
+            session,
+            `CLE CTX: 前ページの本文/音声コンテキストを引き継ぎ (残り目安=${savedCtx.remainingSpan || 0})`
+          );
+        }
+      }
+    }
+  }
+
   let screenshotDataUrl = null;
   if (settings.includeScreenshot) {
     try {
@@ -3517,6 +3628,16 @@ async function executeSingleStep(tabId, isAutoMode) {
       session.lastAnsweredBaseKey = frameData.questionBaseKey;
       session.lastAnsweredAt = Date.now();
       session.waitedForSameKey = false;
+    }
+    if (cleSavedCtxUsed && frameData.cleAttemptKey) {
+      const savedCtx = await getCleAttemptContext(frameData.cleAttemptKey);
+      if (savedCtx && (savedCtx.remainingSpan || 0) > 0) {
+        await setCleAttemptContext(frameData.cleAttemptKey, {
+          ...savedCtx,
+          remainingSpan: savedCtx.remainingSpan - 1,
+          updatedAt: Date.now()
+        });
+      }
     }
   }
 
@@ -3793,18 +3914,20 @@ async function reinjectAllOpenTabs(onlyIfDead = false) {
         }
       }
 
+      const targetFiles = getContentScriptFilesForUrl(t.url);
+
       // Inject top frame first so restricted cross-origin iframes never block main-frame HUD replacement
       chrome.scripting
         .executeScript({
           target: { tabId: t.id, frameIds: [0] },
-          files: ["content.js"]
+          files: targetFiles
         })
         .catch(() => {});
 
       chrome.scripting
         .executeScript({
           target: { tabId: t.id, allFrames: true },
-          files: ["content.js"]
+          files: targetFiles
         })
         .catch(() => {});
     }

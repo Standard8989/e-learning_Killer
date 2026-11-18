@@ -47,9 +47,26 @@
   "content_scripts": [
     {
       "matches": [
-        "<all_urls>"
+        "*://*.cle.osaka-u.ac.jp/*",
+        "*://cle.koan.osaka-u.ac.jp/*"
       ],
       "js": [
+        "hud.js",
+        "adapters/cle.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "exclude_matches": [
+        "*://*.cle.osaka-u.ac.jp/*",
+        "*://cle.koan.osaka-u.ac.jp/*"
+      ],
+      "js": [
+        "hud.js",
         "content.js"
       ],
       "all_frames": true,

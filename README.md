@@ -99,9 +99,20 @@ PC ローカルサーバーを起動していない場合でも動作し、ポ�
 
 ---
 
+## サイト別アダプタ構成（大阪大学 CLE / Blackboard Ultra 対応）
+
+- **サイト別にコンテンツスクリプトを分離**: `manifest.json` により大阪大学 CLE（`www.cle.osaka-u.ac.jp` 等）では [adapters/cle.js](adapters/cle.js) のみが動作し、Reallyenglish 用スクリプト（[content.js](content.js)）の自動進行・再挑戦ロジックは実行されません（右下のパネル表示も `CLE` バッジ付きになります）。
+- **CLE の安全ガード**:
+  - コース一覧／概要画面からのテスト自動開始（制限時間タイマー起動）は行いません。
+  - 正誤・多肢選択・複数空欄（和文英訳・単語並び替え）・`<audio>` 音声問題・前ページ引き継ぎ長文／音声に対応しつつ、`bb-autosave` 完了を待ってから「続行」を押します。
+  - 最終ページの **「提出」「保存して閉じる」「テストを提出しますか？」は絶対に自動クリックせず**、全問入力後に自動停止して目視確認を待ちます。
+
+---
+
 ## ディレクトリ構成
 
-- `manifest.json` / `background.js` / `content.js`: 拡張機能本体（MV3 Service Worker・DOM解析/実行/HUD）
+- `manifest.json` / `background.js`: 拡張機能本体（MV3 設定・Service Worker・AI / Whisper STT 連携）
+- `hud.js` / `content.js` / `adapters/cle.js`: 共通フローティング HUD とサイト別 DOM 解析・操作アダプタ
 - `popup.html` / `popup.js` / `popup.css`: 設定・ステータス・デバッグポップアップ UI
 - `offscreen.html` / `offscreen.js` / `vendor/transformers/`: ブラウザ内ローカル Whisper WASM 実行ワーカー
 - `local-stt/`: Windows 用ローカル `whisper.cpp` サーバーの導入・手動起動用バッチ／PowerShell スクリプト
