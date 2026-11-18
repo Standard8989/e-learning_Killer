@@ -7,7 +7,7 @@
 ## 主な特徴
 
 - **DeepSeek 標準対応 & マルチ LLM API 対応**:
-  - デフォルトで **DeepSeek** (`deepseek-chat` / `deepseek-reasoner`) に対応
+  - デフォルトで **DeepSeek** (`deepseek-flash` / `deepseek-v4-pro` / `deepseek-chat` / `deepseek-reasoner`) に対応
   - **OpenAI / Google Gemini (OpenAI互換・Native API) / Anthropic Claude / OpenRouter / Groq / Ollama (ローカルLLM) / カスタム (OpenAI互換API)** をプリセットから切替可能（API キーはプリセットごとに保持）
 - **Whisper 音声認識によるリスニング自動解答（ローカル完結 & API 両対応）**:
   - **PC ローカルサーバー（`whisper.cpp`）**、**ブラウザ内ローカル AI（Whisper WASM）**、**クラウド音声 API（Groq / Gemini / OpenAI / ElevenLabs）** の 3 系統に対応

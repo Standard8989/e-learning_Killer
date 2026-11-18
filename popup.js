@@ -143,7 +143,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const presetKey = s.providerPreset || "deepseek";
     providerPreset.value = presetKey;
     apiFormat.value = s.apiFormat || "openai";
-    modelInput.value = s.model || "deepseek-chat";
+    modelInput.value = s.model || "deepseek-flash";
     baseUrlInput.value = s.baseUrl || "https://api.deepseek.com";
     apiKeyInput.value = s.apiKey || "";
     updateApiKeyPlaceholder(presetKey);

@@ -5,7 +5,7 @@ const PRESETS = {
     label: "DeepSeek",
     apiFormat: "openai",
     baseUrl: "https://api.deepseek.com",
-    defaultModel: "deepseek-chat"
+    defaultModel: "deepseek-flash"
   },
   openai: {
     label: "OpenAI",
@@ -63,7 +63,7 @@ const DEFAULT_SETTINGS = {
   baseUrl: "https://api.deepseek.com",
   apiKey: "",
   apiKeysByPreset: {},
-  model: "deepseek-chat",
+  model: "deepseek-flash",
   modelsByPreset: {},
   sttProvider: "auto",
   sttApiKey: "",
@@ -981,9 +981,16 @@ async function callLLMSingleAttempt(
       : userPrompt;
 
     const isStrictReasoner = /reasoner|deepseek-r1|qwq|^o[134](?:-|$)|\bgpt-5/i.test(model);
+    const isDeepSeekDefaultThinking =
+      baseUrl.includes("api.deepseek.com") ||
+      /^deepseek-(?:flash|v4|chat)/i.test(model);
     const isThinkingModel =
-      isStrictReasoner || /\bgpt-oss\b|qwen3|thinking|gemini-2\.[59]|gemini-3/i.test(model);
-    const supportsLowEffort = /\bgpt-oss\b|gemini-2\.[59]|gemini-3/i.test(model);
+      isStrictReasoner ||
+      isDeepSeekDefaultThinking ||
+      /\bgpt-oss\b|qwen3|thinking|gemini-2\.[59]|gemini-3/i.test(model);
+    const supportsLowEffort =
+      (!isStrictReasoner && isDeepSeekDefaultThinking) ||
+      /\bgpt-oss\b|gemini-2\.[59]|gemini-3/i.test(model);
     const thinkingFloor = isThinkingModel ? 2048 : 0;
     const effectiveMaxTokens = Math.max(
       Number(maxOutputTokens) || 0,
