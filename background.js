@@ -114,6 +114,7 @@ function getOrCreateSession(tabId) {
       courseWaitCount: 0,
       courseScrolledOnce: false,
       courseReturnAttempts: 0,
+      consecutiveStepErrors: 0,
       lastStateHash: null,
       sameStateCount: 0,
       lastReason: "",
@@ -873,16 +874,50 @@ function parseJsonFromLLM(rawText) {
   }
 }
 
-async function callLLM(settings, systemPrompt, userPrompt, screenshotDataUrl, signal, maxOutputTokens = 0) {
+function parseRetryAfterMs(res) {
+  try {
+    const raw = res?.headers?.get?.("retry-after");
+    if (!raw) return 0;
+    const secs = Number(raw);
+    if (!Number.isNaN(secs) && secs > 0) return Math.min(35000, Math.round(secs * 1000));
+  } catch (_) {}
+  return 0;
+}
+
+function makeLlmError(message, { retryable = true, retryAfterMs = 0, disableJsonMode = false } = {}) {
+  const err = new Error(message);
+  err.retryable = retryable;
+  err.retryAfterMs = retryAfterMs;
+  err.disableJsonMode = disableJsonMode;
+  return err;
+}
+
+async function callLLMSingleAttempt(
+  settings,
+  systemPrompt,
+  userPrompt,
+  screenshotDataUrl,
+  signal,
+  maxOutputTokens = 0,
+  attemptOpts = {}
+) {
   const apiFormat = settings.apiFormat || "openai";
   const baseUrl = (settings.baseUrl || "").trim().replace(/\/+$/, "");
   const apiKey = (settings.apiKey || "").trim();
   const model = (settings.model || "").trim();
+  const {
+    forceJsonMode = true,
+    temperatureOverride = null,
+    minMaxTokens = 0,
+    timeoutMs = 45000
+  } = attemptOpts;
 
-  if (!baseUrl) throw new Error("Base URLが設定されていません");
-  if (!model) throw new Error("モデル名が設定されていません");
+  if (!baseUrl) throw makeLlmError("Base URLが設定されていません", { retryable: false });
+  if (!model) throw makeLlmError("モデル名が設定されていません", { retryable: false });
   if (!apiKey && settings.providerPreset !== "ollama" && settings.providerPreset !== "custom") {
-    throw new Error("APIキーが未設定です。拡張機能ポップアップの「API設定」から入力してください。");
+    throw makeLlmError("APIキーが未設定です。拡張機能ポップアップの「API設定」から入力してください。", {
+      retryable: false
+    });
   }
 
   if (apiFormat === "openai") {
@@ -901,6 +936,7 @@ async function callLLM(settings, systemPrompt, userPrompt, screenshotDataUrl, si
       : userPrompt;
 
     const isReasoner = /reasoner|deepseek-r1|qwq|^o[134](?:-|$)|\bgpt-5/i.test(model);
+    const effectiveMaxTokens = Math.max(Number(maxOutputTokens) || 0, Number(minMaxTokens) || 0);
 
     const buildBody = (useJsonMode) => {
       const body = {
@@ -911,8 +947,10 @@ async function callLLM(settings, systemPrompt, userPrompt, screenshotDataUrl, si
         ]
       };
       if (!isReasoner) {
-        body.temperature = 0.0;
-        if (maxOutputTokens > 0) body.max_tokens = maxOutputTokens;
+        body.temperature = temperatureOverride != null ? temperatureOverride : 0.0;
+        if (effectiveMaxTokens > 0) {
+          body.max_tokens = useJsonMode ? effectiveMaxTokens : Math.max(effectiveMaxTokens, 1100);
+        }
       }
       if (useJsonMode && !isReasoner) {
         body.response_format = { type: "json_object" };
@@ -920,50 +958,77 @@ async function callLLM(settings, systemPrompt, userPrompt, screenshotDataUrl, si
       return body;
     };
 
-    let res = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(buildBody(true)),
+    let res = await fetchWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(buildBody(forceJsonMode))
+      },
+      timeoutMs,
       signal
-    });
+    );
 
     if (res.status === 404 && baseUrl.includes("generativelanguage.googleapis.com")) {
       const discovered = await discoverGeminiModels(apiKey, signal).catch(() => null);
       if (discovered && discovered.models.length > 0) {
         for (const fallbackModel of discovered.models.slice(0, 3)) {
-          const retryBody = buildBody(true);
+          const retryBody = buildBody(forceJsonMode);
           retryBody.model = fallbackModel;
-          res = await fetch(endpoint, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(retryBody),
+          res = await fetchWithTimeout(
+            endpoint,
+            {
+              method: "POST",
+              headers,
+              body: JSON.stringify(retryBody)
+            },
+            timeoutMs,
             signal
-          });
+          );
           if (res.status !== 404) break;
         }
       }
     }
 
-    if (res.status === 400) {
+    if (res.status === 400 && forceJsonMode) {
       const errPreview = await res.clone().text().catch(() => "");
-      if (/response_format|json_object/i.test(errPreview)) {
-        res = await fetch(endpoint, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(buildBody(false)),
+      if (/response_format|json_object|json_validate_failed|Failed to generate JSON/i.test(errPreview)) {
+        res = await fetchWithTimeout(
+          endpoint,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify(buildBody(false))
+          },
+          timeoutMs,
           signal
-        });
+        );
       }
     }
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      throw new Error(`APIエラー (${res.status}): ${errText.slice(0, 200)}`);
+      const retryAfterMs = parseRetryAfterMs(res);
+      const isAuthErr = res.status === 401 || res.status === 403;
+      const isJsonValidate = /json_validate_failed|Failed to generate JSON|response_format/i.test(errText);
+      const isTransientStatus = res.status === 408 || res.status === 429 || res.status >= 500 || isJsonValidate;
+      throw makeLlmError(`APIエラー (${res.status}): ${errText.slice(0, 200)}`, {
+        retryable: !isAuthErr && isTransientStatus,
+        retryAfterMs,
+        disableJsonMode: isJsonValidate
+      });
     }
 
     const data = await res.json();
     const content = data?.choices?.[0]?.message?.content || "";
-    return parseJsonFromLLM(content);
+    try {
+      return parseJsonFromLLM(content);
+    } catch (parseErr) {
+      throw makeLlmError(parseErr?.message || String(parseErr), {
+        retryable: true,
+        disableJsonMode: true
+      });
+    }
   }
 
   if (apiFormat === "anthropic") {
@@ -981,32 +1046,46 @@ async function callLLM(settings, systemPrompt, userPrompt, screenshotDataUrl, si
     }
     userContent.push({ type: "text", text: userPrompt });
 
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true"
+    const res = await fetchWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true"
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: Math.max(1024, Number(minMaxTokens) || 0),
+          temperature: temperatureOverride != null ? temperatureOverride : 0.0,
+          system: systemPrompt,
+          messages: [{ role: "user", content: userContent }]
+        })
       },
-      body: JSON.stringify({
-        model,
-        max_tokens: 1024,
-        temperature: 0.0,
-        system: systemPrompt,
-        messages: [{ role: "user", content: userContent }]
-      }),
+      timeoutMs,
       signal
-    });
+    );
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      throw new Error(`Anthropic APIエラー (${res.status}): ${errText.slice(0, 200)}`);
+      const retryAfterMs = parseRetryAfterMs(res);
+      const isAuthErr = res.status === 401 || res.status === 403;
+      const isTransientStatus = res.status === 408 || res.status === 429 || res.status >= 500 || res.status === 529;
+      throw makeLlmError(`Anthropic APIエラー (${res.status}): ${errText.slice(0, 200)}`, {
+        retryable: !isAuthErr && isTransientStatus,
+        retryAfterMs
+      });
     }
 
     const data = await res.json();
     const textPart = (data?.content || []).find((c) => c.type === "text")?.text || "";
-    return parseJsonFromLLM(textPart);
+    try {
+      return parseJsonFromLLM(textPart);
+    } catch (parseErr) {
+      throw makeLlmError(parseErr?.message || String(parseErr), { retryable: true });
+    }
   }
 
   if (apiFormat === "gemini") {
@@ -1031,34 +1110,131 @@ async function callLLM(settings, systemPrompt, userPrompt, screenshotDataUrl, si
       const endpoint = `https://generativelanguage.googleapis.com/${discovered.apiVersion}/models/${encodeURIComponent(
         m
       )}:generateContent?key=${encodeURIComponent(apiKey)}`;
-      lastRes = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts }],
-          generationConfig: {
-            temperature: 0.0,
-            responseMimeType: "application/json"
-          }
-        }),
+      const genConfig = {
+        temperature: temperatureOverride != null ? temperatureOverride : 0.0
+      };
+      if (forceJsonMode) {
+        genConfig.responseMimeType = "application/json";
+      }
+      lastRes = await fetchWithTimeout(
+        endpoint,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts }],
+            generationConfig: genConfig
+          })
+        },
+        timeoutMs,
         signal
-      });
+      );
       if (lastRes.ok) break;
       if (lastRes.status !== 404 && lastRes.status !== 400 && lastRes.status !== 429) break;
     }
 
     if (!lastRes.ok) {
       const errText = await lastRes.text().catch(() => "");
-      throw new Error(`Gemini APIエラー (${lastRes.status}): ${errText.slice(0, 200)}`);
+      const retryAfterMs = parseRetryAfterMs(lastRes);
+      const isAuthErr = lastRes.status === 401 || lastRes.status === 403 || /API_KEY_INVALID/i.test(errText);
+      throw makeLlmError(`Gemini APIエラー (${lastRes.status}): ${errText.slice(0, 200)}`, {
+        retryable: !isAuthErr,
+        retryAfterMs,
+        disableJsonMode: lastRes.status === 400
+      });
     }
 
     const data = await lastRes.json();
     const textPart =
       data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("\n") || "";
-    return parseJsonFromLLM(textPart);
+    try {
+      return parseJsonFromLLM(textPart);
+    } catch (parseErr) {
+      throw makeLlmError(parseErr?.message || String(parseErr), {
+        retryable: true,
+        disableJsonMode: true
+      });
+    }
   }
 
-  throw new Error(`未対応のAPIフォーマットです: ${apiFormat}`);
+  throw makeLlmError(`未対応のAPIフォーマットです: ${apiFormat}`, { retryable: false });
+}
+
+async function callLLM(
+  settings,
+  systemPrompt,
+  userPrompt,
+  screenshotDataUrl,
+  signal,
+  maxOutputTokens = 0,
+  retryOpts = {}
+) {
+  const maxAttempts = Math.max(1, Number(retryOpts.maxAttempts) || 4);
+  const backoffSchedule = Array.isArray(retryOpts.backoffMs)
+    ? retryOpts.backoffMs
+    : [2500, 6000, 12000];
+  const validateDecision = typeof retryOpts.validateDecision === "function"
+    ? retryOpts.validateDecision
+    : null;
+  const onRetry = typeof retryOpts.onRetry === "function" ? retryOpts.onRetry : null;
+
+  let forceJsonMode = true;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+
+    const attemptTemp = attempt === 1 ? null : Math.min(0.45, (attempt - 1) * 0.15);
+    const minMaxTokens = attempt === 1 ? 0 : 1200;
+
+    try {
+      const parsed = await callLLMSingleAttempt(
+        settings,
+        systemPrompt,
+        userPrompt,
+        screenshotDataUrl,
+        signal,
+        maxOutputTokens,
+        { forceJsonMode, temperatureOverride: attemptTemp, minMaxTokens }
+      );
+      if (validateDecision) {
+        const validationErr = validateDecision(parsed);
+        if (validationErr) {
+          throw makeLlmError(validationErr, { retryable: true, disableJsonMode: false });
+        }
+      }
+      return parsed;
+    } catch (err) {
+      lastErr = err;
+      if (signal?.aborted || err?.name === "AbortError") throw err;
+      if (err?.retryable === false || attempt >= maxAttempts) throw err;
+
+      if (err?.disableJsonMode) {
+        forceJsonMode = false;
+      }
+
+      const baseDelay = backoffSchedule[Math.min(attempt - 1, backoffSchedule.length - 1)] || 5000;
+      const jitter = Math.floor(Math.random() * 800);
+      const waitMs = Math.max(Number(err?.retryAfterMs) || 0, baseDelay + jitter);
+
+      if (onRetry) {
+        await onRetry({
+          attempt,
+          maxAttempts,
+          waitMs,
+          reason: err?.message || String(err)
+        });
+      }
+      await sleep(waitMs, signal);
+      if (signal?.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+    }
+  }
+
+  throw lastErr || new Error("AI呼び出しに失敗しました");
 }
 
 // ============================================================================
@@ -1834,7 +2010,7 @@ function buildPrompts(frameData, settings, alreadyAnsweredCurrentQuestion, allow
   userSections.push(`問題JSON:${JSON.stringify(payload)}`);
 
   const isBatchInputs = compactTexts.length >= 2 || compactSelects.length >= 2;
-  const maxOutputTokens = isBatchInputs ? 700 : 380;
+  const maxOutputTokens = isBatchInputs ? 1000 : 600;
 
   return {
     systemPrompt: STATIC_SYSTEM_PROMPT,
@@ -2723,6 +2899,30 @@ async function executeSingleStep(tabId, isAutoMode) {
     allowGlobalSubmit
   );
 
+  const validateDecision = (dec) => {
+    if (!dec || typeof dec !== "object" || Array.isArray(dec)) {
+      return "AIのJSON出力がオブジェクトではありません";
+    }
+    if (!["answer", "next_only", "completed", "wait"].includes(dec.status)) {
+      return `不正なstatus値です (${dec.status || "empty"})`;
+    }
+    if (dec.status === "answer") {
+      const hasOpts = (frameData.options || []).length > 0;
+      const hasSels = (frameData.selects || []).length > 0;
+      const hasEmptyTxts = (frameData.textInputs || []).some((t) => !t.currentValue);
+      const outOpts = Array.isArray(dec.selectedOptionIds) ? dec.selectedOptionIds.filter(Boolean) : [];
+      const outSels = Array.isArray(dec.selectValues) ? dec.selectValues.filter((s) => s?.id) : [];
+      const outTxts = Array.isArray(dec.textValues) ? dec.textValues.filter((t) => t?.id && String(t.value ?? "").trim() !== "") : [];
+      if (hasOpts && outOpts.length === 0) return "AIの選択回答が空でした (selectedOptionIds=[])";
+      if (hasSels && outSels.length === 0) return "AIのselect回答が空でした (selectValues=[])";
+      if (hasEmptyTxts && outTxts.length === 0) return "AIのテキスト入力回答が空でした (textValues=[])";
+    }
+    if (dec.status === "next_only" && (frameData.buttons || []).length > 0 && !dec.clickButtonId) {
+      return "AIのボタン選択が空でした (clickButtonId=null)";
+    }
+    return null;
+  };
+
   const t0 = Date.now();
   const decision = await callLLM(
     settings,
@@ -2730,7 +2930,17 @@ async function executeSingleStep(tabId, isAutoMode) {
     userPrompt,
     screenshotDataUrl,
     signal,
-    maxOutputTokens
+    maxOutputTokens,
+    {
+      maxAttempts: isAutoMode ? 4 : 2,
+      validateDecision,
+      onRetry: async ({ attempt, maxAttempts, waitMs, reason }) => {
+        const sec = Math.max(1, Math.round(waitMs / 1000));
+        session.phase = `⏳ AI応答エラーのため待機後リトライ (${attempt}/${maxAttempts - 1}, ${sec}秒後)...`;
+        appendLog(session, `LLM RETRY (${attempt}/${maxAttempts - 1}) in ${sec}s: ${String(reason).slice(0, 90)}`);
+        await broadcastStatus(tabId);
+      }
+    }
   );
   const elapsedMs = Date.now() - t0;
 
@@ -2937,6 +3147,7 @@ async function startAutoLoop(tabId) {
   session.courseWaitCount = 0;
   session.courseScrolledOnce = false;
   session.courseReturnAttempts = 0;
+  session.consecutiveStepErrors = 0;
   session.sameStateCount = 0;
   session.lastStateHash = null;
   session.waitedForSameKey = false;
@@ -2946,6 +3157,8 @@ async function startAutoLoop(tabId) {
   appendLog(session, "=== 全自動モード開始 ===");
   await ensureContentScripts(tabId);
   await broadcastStatus(tabId);
+
+  const outerRetryScheduleMs = [10000, 20000, 35000, 60000];
 
   (async () => {
     try {
@@ -2960,11 +3173,36 @@ async function startAutoLoop(tabId) {
         let result;
         try {
           result = await executeSingleStep(tabId, true);
+          session.consecutiveStepErrors = 0;
         } catch (stepErr) {
+          if (signal.aborted || stepErr?.name === "AbortError") {
+            throw stepErr;
+          }
           const msg = String(stepErr?.message || stepErr);
           if (/message port closed|Receiving end does not exist|frame was removed/i.test(msg)) {
+            session.consecutiveStepErrors += 1;
+            if (session.consecutiveStepErrors > 8) throw stepErr;
             appendLog(session, `RETRY: 画面遷移中の通信リセット (${msg.slice(0, 50)})`);
-            await sleep(900, signal);
+            await sleep(1100, signal);
+            continue;
+          }
+          const isPermanentErr =
+            stepErr?.retryable === false ||
+            /APIキーが未設定|Base URLが設定されていません|モデル名が設定されていません|認証エラー|APIエラー \(40[13]\)|無効です/i.test(
+              msg
+            );
+          if (!isPermanentErr && session.consecutiveStepErrors < outerRetryScheduleMs.length) {
+            const waitMs = outerRetryScheduleMs[session.consecutiveStepErrors];
+            session.consecutiveStepErrors += 1;
+            const sec = Math.round(waitMs / 1000);
+            session.phase = `⏳ エラー発生・待機後に自動リトライ (${session.consecutiveStepErrors}/${outerRetryScheduleMs.length}, ${sec}秒後)...`;
+            appendLog(
+              session,
+              `AUTO RETRY (${session.consecutiveStepErrors}/${outerRetryScheduleMs.length}) after ${sec}s: ${msg.slice(0, 100)}`
+            );
+            await broadcastStatus(tabId);
+            await sleep(waitMs, signal);
+            if (signal.aborted) break;
             continue;
           }
           throw stepErr;
@@ -3009,7 +3247,8 @@ async function startAutoLoop(tabId) {
         session.phase.includes("クリック中") ||
         session.phase.includes("開いています") ||
         session.phase.includes("戻っています") ||
-        session.phase.includes("スキップ中")
+        session.phase.includes("スキップ中") ||
+        session.phase.includes("リトライ")
       ) {
         session.phase = "停止中";
       }
@@ -3391,6 +3630,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           s.courseWaitCount = 0;
           s.courseScrolledOnce = false;
           s.courseReturnAttempts = 0;
+          s.consecutiveStepErrors = 0;
           resetPerLessonState(s);
           s.lastReason = "";
           s.lastAnswerSummary = "";
