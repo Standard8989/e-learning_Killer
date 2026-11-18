@@ -1351,33 +1351,70 @@ async function discoverGeminiModels(apiKey, signal) {
 let creatingOffscreenPromise = null;
 const activeProgressListeners = new Set();
 
+async function waitForOffscreenReady(maxAttempts = 25) {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const pong = await chrome.runtime.sendMessage({
+        target: "offscreen",
+        type: "ELK_OFFSCREEN_PING"
+      });
+      if (pong?.ok) return true;
+    } catch (_) {
+      // offscreen.js module still loading/initializing
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
 async function ensureOffscreenDocument() {
+  let hasContext = false;
   if (typeof chrome.runtime.getContexts === "function") {
     const existing = await chrome.runtime.getContexts({
       contextTypes: ["OFFSCREEN_DOCUMENT"]
     });
-    if (existing.length > 0) return;
+    hasContext = existing.length > 0;
   }
-  if (creatingOffscreenPromise) {
+  if (!hasContext) {
+    if (!creatingOffscreenPromise) {
+      creatingOffscreenPromise = chrome.offscreen
+        .createDocument({
+          url: "offscreen.html",
+          reasons: ["AUDIO_PLAYBACK"],
+          justification: "Run in-browser local Whisper STT (WASM) and audio PCM resampling"
+        })
+        .catch((err) => {
+          // Ignore if already created concurrently
+          if (!/Only a single offscreen document/i.test(String(err?.message || err))) {
+            throw err;
+          }
+        })
+        .finally(() => {
+          creatingOffscreenPromise = null;
+        });
+    }
     await creatingOffscreenPromise;
-    return;
   }
-  creatingOffscreenPromise = chrome.offscreen
-    .createDocument({
-      url: "offscreen.html",
-      reasons: ["AUDIO_PLAYBACK"],
-      justification: "Run in-browser local Whisper STT (WASM) and audio PCM resampling"
-    })
-    .catch((err) => {
-      // Ignore if already created concurrently
-      if (!/Only a single offscreen document/i.test(String(err?.message || err))) {
-        throw err;
-      }
-    })
-    .finally(() => {
-      creatingOffscreenPromise = null;
-    });
-  await creatingOffscreenPromise;
+
+  const ready = await waitForOffscreenReady();
+  if (!ready) {
+    throw new Error("オフスクリーンドキュメント (offscreen.html) の初期化応答がありません");
+  }
+}
+
+async function sendOffscreenMessage(payload) {
+  await ensureOffscreenDocument();
+  try {
+    return await chrome.runtime.sendMessage({ ...payload, target: "offscreen" });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (!/Receiving end does not exist|message port closed/i.test(msg)) {
+      throw err;
+    }
+    await new Promise((r) => setTimeout(r, 150));
+    await ensureOffscreenDocument();
+    return await chrome.runtime.sendMessage({ ...payload, target: "offscreen" });
+  }
 }
 
 function buildLocalSttUrlCandidates(localSttUrl) {
@@ -1438,9 +1475,7 @@ async function ensureWavAudio(audioRes) {
   ) {
     return audioRes;
   }
-  await ensureOffscreenDocument();
-  const conv = await chrome.runtime.sendMessage({
-    target: "offscreen",
+  const conv = await sendOffscreenMessage({
     type: "ELK_OFFSCREEN_DECODE_WAV",
     base64: audioRes.base64
   });
@@ -1716,7 +1751,6 @@ async function transcribeWithLocalServer(serverUrlRaw, audioRes, candidateHint, 
 }
 
 async function transcribeWithLocalBrowser(modelId, audioRes, candidateHint, signal, onProgress) {
-  await ensureOffscreenDocument();
   if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
   const shortName = (modelId || "whisper-base.en").split("/").pop();
@@ -1730,14 +1764,14 @@ async function transcribeWithLocalBrowser(modelId, audioRes, candidateHint, sign
   activeProgressListeners.add(progressCb);
 
   try {
-    const res = await chrome.runtime.sendMessage({
-      target: "offscreen",
+    const res = await sendOffscreenMessage({
       type: "ELK_OFFSCREEN_TRANSCRIBE_LOCAL",
       modelId: modelId || "onnx-community/whisper-base.en",
       base64: audioRes.base64,
       mimeType: audioRes.mimeType || "audio/mpeg",
       candidateHint: candidateHint || ""
     });
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
     if (!res?.ok) {
       throw new Error(res?.error || "ブラウザ内ローカルWhisperの文字起こしに失敗しました");
