@@ -1,0 +1,73 @@
+{
+  "manifest_version": 3,
+  "name": "E-Learning Killer - AI自動解答アシスタント",
+  "version": "1.0.0",
+  "description": "ブラウザ上の選択式クイズ・eラーニング問題をAI（DeepSeek / OpenAI / Gemini / Claude等）＋ローカルWhisper音声認識で自動解析・全自動解答します。",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "webNavigation",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "vendor/transformers/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "E-Learning Killer",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "toggle-auto": {
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
+      "description": "全自動モードの開始 / 停止"
+    },
+    "solve-once": {
+      "suggested_key": {
+        "default": "Alt+Shift+Q"
+      },
+      "description": "現在の1問だけ解く"
+    }
+  }
+}
