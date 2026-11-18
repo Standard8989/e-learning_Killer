@@ -374,12 +374,12 @@
     /(解答する|回答する|解答を送信|回答を送信|採点する|答え合わせ|提出する|テストを提出|テストを終了|終了して採点|完了して採点|確認する|チェックする|判定する)/i;
 
   const NEXT_BTN_REGEX =
-    /^(次へ|次の問題|次の問題へ|次へ進む|次に進む|進む|次問|次問へ|次ページ|次のページ|開始|開始する|スタート|テスト開始|受講開始|続ける|続行|再開|再開する|解説を閉じる|完了|完了する|終了する|結果を見る|結果表示|採点結果|ok|yes|はい|next|continue|start|resume|finish)$/i;
+    /^(次へ|次の問題|次の問題へ|次へ進む|次に進む|進む|次問|次問へ|次ページ|次のページ|開始|開始する|スタート|テスト開始|受講開始|テストを受ける|テストを受け直す|受け直す|再挑戦|再テスト|続ける|続行|再開|再開する|解説を閉じる|完了|完了する|終了する|結果を見る|結果表示|採点結果|ok|yes|はい|next|continue|start|resume|finish)$/i;
   const NEXT_PARTIAL_REGEX =
     /(次の問題|次へ進む|次に進む|次のパート|次のセクション|次のアクティビティ|次のステージ|次のレッスン|パートへ進む|ステージへ進む|レッスンへ進む|完了して次へ|次の設問|次のページ|テストを開始|解説を閉じる|結果を見る|次のステップ|next\s*(?:question|part|section|step|lesson|activity))/i;
 
   const AVOID_BTN_REGEX =
-    /^(戻る|前へ|前の問題|前のページ|一覧へ戻る|コース一覧|マイページ|ホーム|ログアウト|サインアウト|退室|中断|中断する|トレーニングを終了|学習を終了|レッスンを終了|やめる|キャンセル|閉じる|リセット|やり直す|もう一回|印刷|logout|sign\s*out|cancel|back|previous)$/i;
+    /^(戻る|前へ|前の問題|前のページ|一覧へ戻る|コース一覧|マイページ|ホーム|ログアウト|サインアウト|退室|中断|中断する|トレーニングを終了|学習を終了|レッスンを終了|やめる|キャンセル|閉じる|リセット|やり直す|もう一回|復習|復習する|印刷|logout|sign\s*out|cancel|back|previous|review)$/i;
 
   const SKIP_BTN_REGEX =
     /^(スキップ|スキップする|後で|あとで|後で取り組む|あとで取り組む|今はしない|後で行う|skip|skipfornow|dolater|later)$/i;
@@ -2262,11 +2262,34 @@
       .map((el) => normalizeText(el.innerText || el.textContent || "").slice(0, 240))
       .filter(Boolean)
       .join(" ");
+    const resultScopeText = `${topBodySnippet.slice(0, 900)} ${modalResultSnippet}`;
     const pageIsResultReview =
       pageIsLessonPage &&
       /(テスト結果\s*[（(]\s*解答と解説\s*[）)]|今回のテスト結果|このレッスンを(?:満点で)?完了しました)/i.test(
-        `${topBodySnippet.slice(0, 900)} ${modalResultSnippet}`
+        resultScopeText
       );
+    const resultScoreMatch = resultScopeText.match(/今回のテスト結果[\s\S]{0,30}?(\d{1,3})\s*%/i);
+    const passThreshMatch = resultScopeText.match(/(\d{1,3})\s*%\s*以上のスコアで合格/i);
+    const passThresholdPct = passThreshMatch ? Number(passThreshMatch[1]) : 70;
+    const resultScorePercent = resultScoreMatch ? Number(resultScoreMatch[1]) : null;
+    let resultOutcome = null;
+    if (pageIsResultReview) {
+      if (
+        /(このレッスンを(?:満点で)?完了しました|(?:^|[^不])合格しました|おめでとう|congratulations|passed)/i.test(
+          resultScopeText
+        ) ||
+        (resultScorePercent !== null && resultScorePercent >= passThresholdPct)
+      ) {
+        resultOutcome = "pass";
+      } else if (
+        /(不合格|合格点に達|基準.{0,12}満た|failed|try again|再挑戦)/i.test(resultScopeText) ||
+        (resultScorePercent !== null && resultScorePercent < passThresholdPct)
+      ) {
+        resultOutcome = "fail";
+      } else {
+        resultOutcome = "unknown";
+      }
+    }
     const pageIsRecordingTask =
       !pageIsCourseDashboard &&
       !pageIsResultReview &&
@@ -3307,6 +3330,8 @@
       hasQuizKeywords,
       isRecordingTask,
       isResultReview: pageIsResultReview,
+      resultOutcome,
+      resultScorePercent,
       isCourseDashboard: pageIsCourseDashboard,
       courseLessons,
       courseGoalDone,
@@ -3323,6 +3348,8 @@
         title: document.title,
         isRecordingTask,
         isResultReview: pageIsResultReview,
+        resultOutcome,
+        resultScorePercent,
         isCourseDashboard: pageIsCourseDashboard,
         courseGoalDone,
         courseLessonsCount: courseLessons.length,

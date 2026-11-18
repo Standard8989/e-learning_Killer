@@ -107,7 +107,9 @@ function getOrCreateSession(tabId) {
       lastAnsweredAt: 0,
       waitedForSameKey: false,
       courseHomeUrl: "",
+      lastStartedCourseLessonKey: "",
       attemptedCourseLessonKeys: new Set(),
+      courseLessonRetryCounts: new Map(),
       lessonStepCount: 0,
       courseWaitCount: 0,
       courseScrolledOnce: false,
@@ -149,14 +151,21 @@ function deriveCourseUrl(rawUrl, fallbackHomeUrl = "") {
 }
 
 const COMPLETION_TEXT_REGEX =
-  /(レッスン完了|レッスン終了|トレーニング完了|テスト完了|学習完了|合格|不合格|congratulations|lesson\s*complete)/i;
+  /(レッスン完了|レッスン終了|トレーニング完了|テスト完了|学習完了|(?:テスト|レッスン)に合格しました|不合格|congratulations|lesson\s*complete)/i;
 
 function extractLessonId(rawUrl) {
   const match = String(rawUrl || "").match(/\/lessons\/([^/?#]+)/i);
   return match ? match[1] : "";
 }
 
-async function handleLessonCompletionTransition(tabId, session, frameData, isAutoMode, logTag = "DONE") {
+async function handleLessonCompletionTransition(
+  tabId,
+  session,
+  frameData,
+  isAutoMode,
+  logTag = "DONE",
+  customPhase = ""
+) {
   const courseUrl = deriveCourseUrl(frameData.url, session.courseHomeUrl);
   if (isAutoMode && !frameData.isCourseDashboard && courseUrl) {
     resetPerLessonState(session);
@@ -164,8 +173,8 @@ async function handleLessonCompletionTransition(tabId, session, frameData, isAut
     session.sameStateCount = 0;
     session.lastStateHash = null;
     session.courseReturnAttempts = 0;
-    session.phase = "🏠 レッスン完了 → コース画面へ戻っています...";
-    session.lastAnswerSummary = "レッスン完了 (次レッスンへ移動)";
+    session.phase = customPhase || "🏠 レッスン完了 → コース画面へ戻っています...";
+    session.lastAnswerSummary = customPhase ? "テスト不合格 (再挑戦準備)" : "レッスン完了 (次レッスンへ移動)";
     appendLog(session, `${logTag} LESSON -> コース画面へ戻る: ${courseUrl}`);
     await broadcastStatus(tabId);
     await chrome.tabs.update(tabId, { url: courseUrl });
@@ -864,7 +873,7 @@ function parseJsonFromLLM(rawText) {
   }
 }
 
-async function callLLM(settings, systemPrompt, userPrompt, screenshotDataUrl, signal) {
+async function callLLM(settings, systemPrompt, userPrompt, screenshotDataUrl, signal, maxOutputTokens = 0) {
   const apiFormat = settings.apiFormat || "openai";
   const baseUrl = (settings.baseUrl || "").trim().replace(/\/+$/, "");
   const apiKey = (settings.apiKey || "").trim();
@@ -891,7 +900,7 @@ async function callLLM(settings, systemPrompt, userPrompt, screenshotDataUrl, si
         ]
       : userPrompt;
 
-    const isReasoner = /reasoner|deepseek-r1|qwq/i.test(model);
+    const isReasoner = /reasoner|deepseek-r1|qwq|^o[134](?:-|$)|\bgpt-5/i.test(model);
 
     const buildBody = (useJsonMode) => {
       const body = {
@@ -901,7 +910,10 @@ async function callLLM(settings, systemPrompt, userPrompt, screenshotDataUrl, si
           { role: "user", content: userContent }
         ]
       };
-      if (!isReasoner) body.temperature = 0.0;
+      if (!isReasoner) {
+        body.temperature = 0.0;
+        if (maxOutputTokens > 0) body.max_tokens = maxOutputTokens;
+      }
       if (useJsonMode && !isReasoner) {
         body.response_format = { type: "json_object" };
       }
@@ -1755,78 +1767,80 @@ async function transcribeAudioBase64(
   }
 }
 
+const STATIC_SYSTEM_PROMPT = [
+  "語学・eラーニング問題を正確に解くAI。必ずJSON1オブジェクトのみ出力。",
+  'スキーマ:{"reason":"本文や音声根拠と各選択肢の比較(日本語100字以内)","status":"answer"|"next_only"|"completed"|"wait","selectedOptionIds":["opt-0"],"selectValues":[{"id":"sel-0","value":"..."}],"textValues":[{"id":"txt-0","value":"..."}],"clickButtonId":"btn-0"|null}',
+  "厳守ルール:",
+  "1. 先頭に[共有本文・音声]がある場合は該当箇所の根拠と言い換えを必ず照合し、直感で選ばない。複数空欄がある箇所は[空欄:id]/Q番号の前後文脈のみ参照。",
+  '2. options/selects/空textInputsがあればstatus="answer"。単一選択は1つ、複数選択指示は該当全ID。文字タイル問題(tileCountあり)は全文字を使い切った完成語を"spelledAnswer"に出し全タイルIDを順にselectedOptionIdsへ出力。clickButtonIdはbuttons内から確定/次へ用を選び無ければnull。',
+  '3. 未解答欄が無く進む画面は"next_only"、終了時は"completed"。'
+].join("\n");
+
 function buildPrompts(frameData, settings, alreadyAnsweredCurrentQuestion, allowGlobalSubmit) {
   const isLetterTileQuestion =
     Array.isArray(frameData.options) &&
     frameData.options.length >= 3 &&
     frameData.options.every((o) => o.type === "tile-order" || (o.text || "").length <= 2);
 
-  const tileCharsList = isLetterTileQuestion
-    ? frameData.options.map((o) => o.text).join(", ")
-    : "";
+  const compactOptions = (frameData.options || []).map((o) => {
+    const out = { id: o.id, text: o.text };
+    if (o.type && o.type !== "button-choice" && o.type !== "radio") {
+      out.type = o.type;
+    }
+    if (o.checked) out.checked = true;
+    return out;
+  });
 
-  const systemPrompt = [
-    "あなたは語学・資格・社内研修などあらゆるeラーニング・選択式問題を100%の精度で解く専門AIです。",
-    "必ず以下のJSON形式のみを出力してください（キーの順序も必ず守ってください）。",
-    "",
-    "出力JSONスキーマ:",
-    "{",
-    '  "reason": "問題文の正確な意味を確認し、全選択肢それぞれの意味・正誤を簡潔に比較検討して正解を特定する推論（日本語・120文字以内）",',
-    '  "status": "answer" | "next_only" | "completed" | "wait",',
-    ...(isLetterTileQuestion
-      ? [
-          `  "spelledAnswer": "全${frameData.options.length}個の文字タイルすべてを余さず使って完成させた英単語・熟語（例: might have）",`
-        ]
-      : []),
-    '  "selectedOptionIds": ["opt-0"],',
-    '  "selectValues": [{"id": "sel-0", "value": "選択肢のvalue"}],',
-    '  "textValues": [{"id": "txt-0", "value": "入力すべき語句"}],',
-    '  "clickButtonId": "btn-0" または null',
-    "}",
-    "",
-    "厳守ルール:",
-    "1. 必ず最初に \"reason\" で `targetQuestion`（現在の問題文）と各選択肢 (`options`) の意味を1つずつ照合してから、最も正確なIDを `selectedOptionIds` に選んでください。直感や先頭バイアスで選ばないでください。",
-    "   - `sharedInstructionOrPassage` に長文（リーディング本文・会話文など）が含まれる場合は、必ず本文の該当箇所の根拠（言い換え表現・慣用句を含む）を確認してから正解を特定してください。",
-    "   - 本文中に複数の番号付き空欄（Q1, Q2, ... や [空欄:sel-0], [空欄:txt-0]）がある場合は、必ず該当空欄の文脈・`contextSnippet` だけを見て解答してください。`sharedInstructionOrPassage` の別の箇所（他のQ番号）と絶対に混同しないでください。論理的必然（must）・不可能/否定（can't/couldn't）・単なる可能性（might/may）等をその空欄の前後理由（because〜等）から厳密に判別してください。",
-    "   - `selects` にドロップダウンがある場合は、各 `sel-#` の `contextSnippet` および本文中の `[空欄:sel-#]` の位置を確認し、すべての `sel-#` に対する正解の `value` を `selectValues` に出力してください。",
-    "   - `textInputs` にキーボード文字入力欄がある場合は、本文中の `[空欄:txt-#]` の位置・`qLabel`・`contextSnippet` を確認し、文法（単数/複数形・時制・品詞・前置詞とのつながり）と文脈に最も正確に一致する語句を、空欄（`currentValue === \"\"`）となっているすべての `txt-#` について `textValues` に出力してください（語句の前後にピリオド等の余計な記号を付けないでください）。",
-    "   - 英単語・熟語・穴埋め問題では、日本語の意味や前後の英文文脈（For example以降の説明など）と各候補の語義を厳密に照合してください。",
-    isLetterTileQuestion
-      ? [
-          `   - 【最重要：文字タイル並べ替え（スペリング・アナグラム）問題】現在の選択肢は文字タイル（計${frameData.options.length}個: [${tileCharsList}]）です。`,
-          `     必ず全${frameData.options.length}個の文字タイルを【1個も余らせずすべて1回ずつ使い切って】空欄に入る英単語・熟語を完成させてください（例: 9文字 [a, e, g, h, h, i, m, t, v] が与えられた場合、"might" の5文字だけで止めず、残りの4文字 [a, e, h, v] も合わせた2語 "might have" の計9文字すべてを完成させてください）。`,
-          `     完成した文字列を "spelledAnswer" に出力し、"selectedOptionIds" には先頭から末尾までの全${frameData.options.length}個のタイルIDを順番に並べてください（同じ文字が複数ある場合は別々のIDを1回ずつ使ってください）。`
-        ].join("\n")
-      : "",
-    '2. 未解答の問題 (`options`、`selects`、または `currentValue` が空の `textInputs`) がある場合: `"status": "answer"` にしてください。',
-    isLetterTileQuestion
-      ? `   - 文字タイル問題では、必ず全${frameData.options.length}個のタイルIDを打鍵順で \`selectedOptionIds\` に並べてください。`
-      : "   - 単一選択（`radio` や `button-choice`）は必ず正解IDを1つだけ指定してください（すでに正解の選択肢が `checked: true` の場合も、そのままその正解IDを `selectedOptionIds` に入れてください）。",
-    "   - 複数選択（`checkbox` で「すべて選べ」等の指示がある場合）は該当する全IDを指定してください。",
-    allowGlobalSubmit
-      ? '   - `buttons` に「確認」「解答する」「回答」「送信」「採点」「決定」「次へ」等のボタンがある場合は、`options` の種類に関わらず必ずそのIDを `"clickButtonId"` に指定してください（ボタンが1つも無い即判定問題のみ `null`）。'
-      : '   - `buttons` に `belongsToActiveQuestion: true` の「確認」「解答する」「決定」等のボタンがある場合は、必ずそのIDを `"clickButtonId"` に指定してください。それ以外のページ全体の完了ボタン等は押さず `null` にしてください。',
-    '3. 未解答の選択肢が無く、解説画面や導入画面で「次へ」「次の問題」「進む」「結果を見る」「完了」「OK」等のボタンを押すべき画面の場合: `"status": "next_only"`, `"selectedOptionIds": []`, `"clickButtonId"` に進むボタンのIDを指定してください。',
-    '4. 全問終了・スコア発表・合格画面でこれ以上進める問題が無い場合: `"status": "completed"`, `"selectedOptionIds": []`, `"clickButtonId": null` にしてください。',
-    settings.customPrompt ? `\n追加の前提知識・ユーザー指示:\n${settings.customPrompt}` : ""
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const compactButtons = (frameData.buttons || [])
+    .filter((b) => allowGlobalSubmit || b.belongsToActiveQuestion)
+    .map((b) => ({ id: b.id, text: b.text }));
+
+  const compactSelects = (frameData.selects || []).map((s) => ({
+    id: s.id,
+    ...(s.currentValue ? { currentValue: s.currentValue } : {}),
+    ...(s.contextSnippet ? { contextSnippet: s.contextSnippet } : {}),
+    choices: s.choices.map((c) => ({ value: c.value, text: c.text }))
+  }));
+
+  const compactTexts = (frameData.textInputs || []).map((t) => ({
+    id: t.id,
+    ...(t.qLabel ? { qLabel: t.qLabel } : {}),
+    ...(t.currentValue ? { currentValue: t.currentValue } : {}),
+    ...(t.contextSnippet ? { contextSnippet: t.contextSnippet } : {})
+  }));
+
+  const qText = frameData.activeQuestionText || frameData.pageText || "";
+  const rawShared = (frameData.sharedContext || "").trim();
+  const useSharedPrefix = rawShared && rawShared !== qText.trim();
 
   const payload = {
-    pageTitle: frameData.title,
-    questionProgressOnPage: frameData.questionSummary,
-    alreadyAnsweredCurrentQuestion: Boolean(alreadyAnsweredCurrentQuestion),
-    sharedInstructionOrPassage: frameData.sharedContext || undefined,
-    targetQuestion: frameData.activeQuestionText || frameData.pageText,
-    options: frameData.options,
-    selects: frameData.selects,
-    textInputs: frameData.textInputs,
-    buttons: frameData.buttons
+    ...(alreadyAnsweredCurrentQuestion ? { alreadyAnswered: true } : {}),
+    q: qText,
+    ...(compactOptions.length > 0 ? { options: compactOptions } : {}),
+    ...(isLetterTileQuestion ? { tileCount: compactOptions.length } : {}),
+    ...(compactSelects.length > 0 ? { selects: compactSelects } : {}),
+    ...(compactTexts.length > 0 ? { textInputs: compactTexts } : {}),
+    ...(compactButtons.length > 0 ? { buttons: compactButtons } : {})
   };
 
-  const userPrompt = `現在の問題データ（JSON）:\n${JSON.stringify(payload, null, 2)}\n\nまず "reason" で各選択肢を慎重に吟味してからJSONを出力してください。`;
-  return { systemPrompt, userPrompt };
+  // Place static context first so DeepSeek/OpenAI prefix caching reuses shared passage & transcript tokens across Q1..Qn!
+  const userSections = [];
+  if (settings.customPrompt) {
+    userSections.push(`[指示]\n${settings.customPrompt}`);
+  }
+  if (useSharedPrefix) {
+    userSections.push(`[共有本文・音声]\n${rawShared}`);
+  }
+  userSections.push(`問題JSON:${JSON.stringify(payload)}`);
+
+  const isBatchInputs = compactTexts.length >= 2 || compactSelects.length >= 2;
+  const maxOutputTokens = isBatchInputs ? 700 : 380;
+
+  return {
+    systemPrompt: STATIC_SYSTEM_PROMPT,
+    userPrompt: userSections.join("\n\n"),
+    maxOutputTokens
+  };
 }
 
 async function executeSingleStep(tabId, isAutoMode) {
@@ -1983,6 +1997,7 @@ async function executeSingleStep(tabId, isAutoMode) {
     session.lastStateHash = null;
     if (isAutoMode) {
       session.attemptedCourseLessonKeys.add(nextLesson.key);
+      session.lastStartedCourseLessonKey = nextLesson.key;
     }
     session.lastReason = `コース画面から次のレッスン「${nextLesson.label}」を開始します。`;
     session.lastAnswerSummary = `[開始] ${nextLesson.label}`;
@@ -2024,11 +2039,40 @@ async function executeSingleStep(tabId, isAutoMode) {
     return { done: false, customNextDelayMs: enteredLesson ? 900 : 1200 };
   }
 
-  // Case TEST_DONE: Test Result / Review screen ("テスト結果 (解答と解説)" / "今回のテスト結果 100%")
+  // Case TEST_DONE: Test Result / Review screen ("テスト結果 (解答と解説)" / "今回のテスト結果 ...")
   // The test is already graded and saved; never traverse P1->P2->P3 review parts or call STT/LLM!
+  // If failed (< pass threshold, e.g. 60% < 70%), unlock retry up to 2 times (3 attempts total).
   if (frameData.isResultReview) {
     resetPerLessonState(session);
     session.lessonStepCount = 0;
+
+    if (isAutoMode && frameData.resultOutcome === "fail") {
+      const lessonIdTag = extractLessonId(frameData.url);
+      const retryKey = session.lastStartedCourseLessonKey || (lessonIdTag ? `lesson:${lessonIdTag}` : "current-lesson");
+      const usedRetries = session.courseLessonRetryCounts.get(retryKey) || 0;
+      const scoreLabel = frameData.resultScorePercent != null ? `${frameData.resultScorePercent}%` : "不合格";
+
+      if (usedRetries < 2) {
+        session.courseLessonRetryCounts.set(retryKey, usedRetries + 1);
+        if (session.lastStartedCourseLessonKey) {
+          session.attemptedCourseLessonKeys.delete(session.lastStartedCourseLessonKey);
+        }
+        appendLog(
+          session,
+          `RESULT FAIL (${scoreLabel}) -> コース画面から再挑戦 (${usedRetries + 1}/2)`
+        );
+        return handleLessonCompletionTransition(
+          tabId,
+          session,
+          frameData,
+          true,
+          "RETRY",
+          `🔄 テスト不合格 (${scoreLabel}) → 再挑戦のため戻っています (${usedRetries + 1}/2)...`
+        );
+      }
+      appendLog(session, `RESULT FAIL (${scoreLabel}): 再挑戦上限(2回)到達のため次レッスンへ`);
+    }
+
     appendLog(session, "RESULT: テスト結果・完了画面を検出 -> 解説周回をスキップ (0 tokens)");
     return handleLessonCompletionTransition(tabId, session, frameData, isAutoMode, "RESULT");
   }
@@ -2536,20 +2580,28 @@ async function executeSingleStep(tabId, isAutoMode) {
       (frameData.textInputs || []).length > 0)
   ) {
     const primaryAudioUrl = frameData.activeAudioUrl || "";
-    const pageCacheKey = `page:${frameData.url}::${frameData.activeQuestionId || "q0"}`;
+    const questionSpecificId = (
+      frameData.questionBaseKey ||
+      frameData.activeQuestionId ||
+      "q0"
+    ).slice(0, 140);
+    const pageCacheKey = `page:${frameData.url}::${questionSpecificId}`;
     const cachedTranscript =
-      (primaryAudioUrl && audioTranscriptCache.get(primaryAudioUrl)) ||
-      audioTranscriptCache.get(pageCacheKey);
+      (primaryAudioUrl && !/^webaudio:\/\//i.test(primaryAudioUrl)
+        ? audioTranscriptCache.get(primaryAudioUrl)
+        : null) || audioTranscriptCache.get(pageCacheKey);
 
     if (cachedTranscript) {
       currentAudioTranscript = cachedTranscript;
       appendLog(session, `AUDIO: キャッシュ済み文字起こしを使用 (${cachedTranscript.length}文字)`);
-      frameData.sharedContext = [
-        frameData.sharedContext,
-        `【リスニング音声の文字起こしスクリプト（最優先根拠）】\n${cachedTranscript}`
-      ]
-        .filter(Boolean)
-        .join("\n\n");
+      if (!(frameData.sharedContext || "").includes(cachedTranscript)) {
+        frameData.sharedContext = [
+          frameData.sharedContext,
+          `【リスニング音声の文字起こしスクリプト（最優先根拠）】\n${cachedTranscript}`
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+      }
     } else {
       const sttCreds = await resolveSttCredentialsAsync(settings, signal);
       if (sttCreds) {
@@ -2573,7 +2625,9 @@ async function executeSingleStep(tabId, isAutoMode) {
             }
           }
           if (audioRes?.ok && audioRes.base64) {
-            const existingByUrl = audioRes.url ? audioTranscriptCache.get(audioRes.url) : null;
+            const isRealAudioUrl =
+              Boolean(audioRes.url) && !/^webaudio:\/\//i.test(audioRes.url);
+            const existingByUrl = isRealAudioUrl ? audioTranscriptCache.get(audioRes.url) : null;
             if (existingByUrl) {
               currentAudioTranscript = existingByUrl;
               audioTranscriptCache.set(pageCacheKey, existingByUrl);
@@ -2601,7 +2655,7 @@ async function executeSingleStep(tabId, isAutoMode) {
               );
               if (transcript) {
                 currentAudioTranscript = transcript;
-                if (audioRes.url) audioTranscriptCache.set(audioRes.url, transcript);
+                if (isRealAudioUrl) audioTranscriptCache.set(audioRes.url, transcript);
                 audioTranscriptCache.set(pageCacheKey, transcript);
                 appendLog(
                   session,
@@ -2610,7 +2664,7 @@ async function executeSingleStep(tabId, isAutoMode) {
               }
             }
 
-            if (currentAudioTranscript) {
+            if (currentAudioTranscript && !(frameData.sharedContext || "").includes(currentAudioTranscript)) {
               frameData.sharedContext = [
                 frameData.sharedContext,
                 `【リスニング音声の文字起こしスクリプト（最優先根拠）】\n${currentAudioTranscript}`
@@ -2662,7 +2716,7 @@ async function executeSingleStep(tabId, isAutoMode) {
     : `AI思考中 (${settings.model})...`;
   await broadcastStatus(tabId);
 
-  const { systemPrompt, userPrompt } = buildPrompts(
+  const { systemPrompt, userPrompt, maxOutputTokens } = buildPrompts(
     frameData,
     settings,
     isSameQuestionJustAnswered,
@@ -2675,7 +2729,8 @@ async function executeSingleStep(tabId, isAutoMode) {
     systemPrompt,
     userPrompt,
     screenshotDataUrl,
-    signal
+    signal,
+    maxOutputTokens
   );
   const elapsedMs = Date.now() - t0;
 
@@ -2876,7 +2931,9 @@ async function startAutoLoop(tabId) {
   session.error = null;
   session.stepCount = 0;
   session.lessonStepCount = 0;
+  session.lastStartedCourseLessonKey = "";
   session.attemptedCourseLessonKeys.clear();
+  session.courseLessonRetryCounts.clear();
   session.courseWaitCount = 0;
   session.courseScrolledOnce = false;
   session.courseReturnAttempts = 0;
@@ -3328,7 +3385,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           s.solvedCount = 0;
           s.stepCount = 0;
           s.lessonStepCount = 0;
+          s.lastStartedCourseLessonKey = "";
           s.attemptedCourseLessonKeys.clear();
+          s.courseLessonRetryCounts.clear();
           s.courseWaitCount = 0;
           s.courseScrolledOnce = false;
           s.courseReturnAttempts = 0;
