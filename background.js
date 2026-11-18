@@ -1206,6 +1206,9 @@ async function callLLMSingleAttempt(
       return body;
     };
 
+    const requestTimeoutMs =
+      effectiveMaxTokens >= 4096 ? Math.max(timeoutMs, 75000) : timeoutMs;
+
     let currentJsonMode = forceJsonMode;
     let currentReasoningEffort = allowReasoningEffort;
     let res = await fetchWithTimeout(
@@ -1215,7 +1218,7 @@ async function callLLMSingleAttempt(
         headers,
         body: JSON.stringify(buildBody(currentJsonMode, currentReasoningEffort))
       },
-      timeoutMs,
+      requestTimeoutMs,
       signal
     );
 
@@ -1232,7 +1235,7 @@ async function callLLMSingleAttempt(
               headers,
               body: JSON.stringify(retryBody)
             },
-            timeoutMs,
+            requestTimeoutMs,
             signal
           );
           if (res.status !== 404) break;
@@ -1257,7 +1260,7 @@ async function callLLMSingleAttempt(
             headers,
             body: JSON.stringify(buildBody(currentJsonMode, currentReasoningEffort))
           },
-          timeoutMs,
+          requestTimeoutMs,
           signal
         );
       }
@@ -1289,7 +1292,7 @@ async function callLLMSingleAttempt(
       const refusal = String(choice?.message?.refusal || "").trim();
       const bumped =
         finishReason === "length" || reasoningLen > 0
-          ? Math.min(4096, Math.max(2400, effectiveMaxTokens * 2 || 2400))
+          ? Math.min(8192, Math.max(4096, effectiveMaxTokens * 2 || 4096))
           : 0;
       const suffixParts = [];
       if (finishReason) suffixParts.push(`finish=${finishReason}`);
@@ -1299,7 +1302,7 @@ async function callLLMSingleAttempt(
         refusal ? `AIが応答を拒否しました: ${refusal.slice(0, 120)}` : `AIからの応答が空でした${detail}`,
         {
           retryable: true,
-          disableJsonMode: true,
+          disableJsonMode: finishReason !== "length",
           disableReasoningEffort: !currentReasoningEffort,
           bumpMinMaxTokens: bumped
         }
@@ -1313,11 +1316,11 @@ async function callLLMSingleAttempt(
     } catch (parseErr) {
       const bumped =
         finishReason === "length"
-          ? Math.min(4096, Math.max(2400, effectiveMaxTokens * 2 || 2400))
+          ? Math.min(8192, Math.max(4096, effectiveMaxTokens * 2 || 4096))
           : 0;
       throw makeLlmError(parseErr?.message || String(parseErr), {
         retryable: true,
-        disableJsonMode: true,
+        disableJsonMode: finishReason !== "length",
         bumpMinMaxTokens: bumped
       });
     }
@@ -2422,13 +2425,6 @@ function buildPrompts(frameData, settings, alreadyAnsweredCurrentQuestion, allow
     choices: s.choices.map((c) => ({ value: c.value, text: c.text }))
   }));
 
-  const compactTexts = (frameData.textInputs || []).map((t) => ({
-    id: t.id,
-    ...(t.qLabel ? { qLabel: t.qLabel } : {}),
-    ...(t.currentValue ? { currentValue: t.currentValue } : {}),
-    ...(t.contextSnippet ? { contextSnippet: t.contextSnippet } : {})
-  }));
-
   const rawQText = frameData.activeQuestionText || frameData.pageText || "";
   const qText = rawQText.replace(
     /(?:\r?\n)+\s*(?:確認|確認する|解答|解答する|回答|回答する|チェック|提出|提出する)\s*$/i,
@@ -2436,6 +2432,16 @@ function buildPrompts(frameData, settings, alreadyAnsweredCurrentQuestion, allow
   );
   const rawShared = (frameData.sharedContext || "").trim();
   const useSharedPrefix = rawShared && rawShared !== rawQText.trim();
+
+  const compactTexts = (frameData.textInputs || []).map((t) => {
+    const inlineAlreadyInQ = qText.includes(`[空欄:${t.id}]`);
+    return {
+      id: t.id,
+      ...(t.qLabel ? { qLabel: t.qLabel } : {}),
+      ...(t.currentValue ? { currentValue: t.currentValue } : {}),
+      ...(t.contextSnippet && !inlineAlreadyInQ ? { contextSnippet: t.contextSnippet } : {})
+    };
+  });
 
   const payload = {
     ...(alreadyAnsweredCurrentQuestion ? { alreadyAnswered: true } : {}),
@@ -2461,7 +2467,14 @@ function buildPrompts(frameData, settings, alreadyAnsweredCurrentQuestion, allow
   userSections.push(`問題JSON:${JSON.stringify(payload)}`);
 
   const isBatchInputs = compactTexts.length >= 2 || compactSelects.length >= 2;
-  const maxOutputTokens = isBatchInputs ? 1000 : isLetterTileQuestion ? 900 : 600;
+  const maxOutputTokens =
+    compactTexts.length >= 6
+      ? Math.min(6144, Math.max(3072, 1600 + compactTexts.length * 180))
+      : isBatchInputs
+        ? 1600
+        : isLetterTileQuestion
+          ? 900
+          : 600;
 
   return {
     systemPrompt: STATIC_SYSTEM_PROMPT,
