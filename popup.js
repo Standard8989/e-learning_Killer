@@ -5,6 +5,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const solvedBadge = document.getElementById("solvedBadge");
   const resetCountBtn = document.getElementById("resetCountBtn");
   const phaseText = document.getElementById("phaseText");
+  const usageText = document.getElementById("usageText");
   const resultPreview = document.getElementById("resultPreview");
   const resultAnswer = document.getElementById("resultAnswer");
   const resultReason = document.getElementById("resultReason");
@@ -105,6 +106,28 @@ document.addEventListener("DOMContentLoaded", async () => {
       "status-dot" + (state.error ? " error" : isRunning ? " running" : "");
     solvedBadge.textContent = `${state.solvedCount || 0}問解答`;
     phaseText.textContent = state.phase || (isRunning ? "実行中..." : "待機中");
+
+    const u = state.usage;
+    if (usageText && u && (u.llmCalls > 0 || u.sttCalls > 0 || u.audioCacheHits > 0)) {
+      const totalTok = (u.promptTokens || 0) + (u.completionTokens || 0);
+      const tokStr = totalTok >= 1000 ? `${(totalTok / 1000).toFixed(1)}k` : `${totalTok}`;
+      const cachePct =
+        u.promptTokens > 0 ? Math.round(((u.cachedTokens || 0) / u.promptTokens) * 100) : 0;
+      const parts = [];
+      if (u.llmCalls > 0) {
+        parts.push(
+          `AI ${u.llmCalls}回 · ${tokStr} tok${cachePct > 0 ? ` (キャッシュ${cachePct}%)` : ""}`
+        );
+      }
+      if (u.sttCalls > 0 || u.audioCacheHits > 0) {
+        parts.push(`音声STT ${u.sttCalls || 0} (キャッシュHit ${u.audioCacheHits || 0})`);
+      }
+      usageText.textContent = parts.join(" / ");
+      usageText.classList.remove("hidden");
+    } else if (usageText) {
+      usageText.textContent = "";
+      usageText.classList.add("hidden");
+    }
 
     if (state.lastAnswerSummary || state.lastReason) {
       resultPreview.classList.remove("hidden");
@@ -447,6 +470,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === "ELK_STATUS_UPDATE" && msg.state?.tabId === activeTabId) {
       renderState(msg.state);
+    }
+    if (msg.type === "ELK_STT_TEST_PROGRESS" && testSttBtn?.disabled && sttStatusMsg) {
+      sttStatusMsg.textContent = `テスト実行中: ${msg.step || "処理中"}...`;
     }
     if (msg.type === "ELK_LOCAL_STT_PROGRESS" && testSttBtn?.disabled && sttStatusMsg) {
       const pct = typeof msg.progress === "number" ? ` (${Math.round(msg.progress)}%)` : "";

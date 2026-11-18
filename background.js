@@ -82,6 +82,103 @@ const DEFAULT_SETTINGS = {
 const tabSessions = new Map();
 const audioTranscriptCache = new Map();
 const deadLocalSttUrls = new Map();
+let transcriptCacheLoaded = false;
+
+async function ensureTranscriptCacheLoaded() {
+  if (transcriptCacheLoaded) return;
+  transcriptCacheLoaded = true;
+  try {
+    const res = await chrome.storage.local.get("elkTranscriptCache");
+    const saved = res?.elkTranscriptCache;
+    if (saved && typeof saved === "object") {
+      for (const [k, entry] of Object.entries(saved)) {
+        if (entry && typeof entry.text === "string" && entry.text) {
+          audioTranscriptCache.set(k, entry.text);
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+async function persistTranscriptKeys(keys, text) {
+  if (!text) return;
+  const cleanKeys = (Array.isArray(keys) ? keys : [keys]).filter(
+    (k) => typeof k === "string" && k.length > 0 && !k.startsWith("page:")
+  );
+  for (const k of Array.isArray(keys) ? keys : [keys]) {
+    if (k) audioTranscriptCache.set(k, text);
+  }
+  if (cleanKeys.length === 0) return;
+  try {
+    const res = await chrome.storage.local.get("elkTranscriptCache");
+    const mapObj = res?.elkTranscriptCache && typeof res.elkTranscriptCache === "object"
+      ? { ...res.elkTranscriptCache }
+      : {};
+    const now = Date.now();
+    for (const k of cleanKeys) {
+      mapObj[k] = { text, ts: now };
+    }
+    const entries = Object.entries(mapObj)
+      .sort((a, b) => (b[1]?.ts || 0) - (a[1]?.ts || 0))
+      .slice(0, 60);
+    await chrome.storage.local.set({ elkTranscriptCache: Object.fromEntries(entries) });
+  } catch (_) {}
+}
+
+function createEmptyUsage() {
+  return {
+    llmCalls: 0,
+    promptTokens: 0,
+    cachedTokens: 0,
+    completionTokens: 0,
+    reasoningTokens: 0,
+    sttCalls: 0,
+    audioCacheHits: 0
+  };
+}
+
+function recordSessionUsage(session, usage) {
+  if (!session || !usage) return;
+  if (!session.usage) session.usage = createEmptyUsage();
+  session.usage.llmCalls += 1;
+  session.usage.promptTokens += Number(usage.promptTokens) || 0;
+  session.usage.cachedTokens += Number(usage.cachedTokens) || 0;
+  session.usage.completionTokens += Number(usage.completionTokens) || 0;
+  session.usage.reasoningTokens += Number(usage.reasoningTokens) || 0;
+}
+
+function extractTokenUsage(apiFormat, data) {
+  if (!data || typeof data !== "object") return null;
+  if (apiFormat === "openai" && data.usage) {
+    const u = data.usage;
+    return {
+      promptTokens: Number(u.prompt_tokens) || 0,
+      cachedTokens:
+        Number(u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens) || 0,
+      completionTokens: Number(u.completion_tokens) || 0,
+      reasoningTokens: Number(u.completion_tokens_details?.reasoning_tokens) || 0
+    };
+  }
+  if (apiFormat === "anthropic" && data.usage) {
+    const u = data.usage;
+    return {
+      promptTokens: (Number(u.input_tokens) || 0) + (Number(u.cache_read_input_tokens) || 0),
+      cachedTokens: Number(u.cache_read_input_tokens) || 0,
+      completionTokens: Number(u.output_tokens) || 0,
+      reasoningTokens: 0
+    };
+  }
+  if (apiFormat === "gemini" && data.usageMetadata) {
+    const m = data.usageMetadata;
+    return {
+      promptTokens: Number(m.promptTokenCount) || 0,
+      cachedTokens: Number(m.cachedContentTokenCount) || 0,
+      completionTokens: Number(m.candidatesTokenCount) || 0,
+      reasoningTokens: Number(m.thoughtsTokenCount) || 0
+    };
+  }
+  return null;
+}
 
 function computeAudioFingerprint(audioRes) {
   const b64 = String(audioRes?.base64 || "");
@@ -140,6 +237,7 @@ function getOrCreateSession(tabId) {
       sameStateCount: 0,
       lastReason: "",
       lastAnswerSummary: "",
+      usage: createEmptyUsage(),
       error: null,
       logs: [],
       abortController: null
@@ -254,6 +352,7 @@ function serializeSessionState(session) {
     stepCount: session.stepCount,
     lastReason: session.lastReason,
     lastAnswerSummary: session.lastAnswerSummary,
+    usage: session.usage ? { ...session.usage } : createEmptyUsage(),
     error: session.error,
     logs: session.logs.slice(-40)
   };
@@ -274,12 +373,30 @@ async function saveSettings(partial) {
 function sleep(ms, signal) {
   return new Promise((resolve) => {
     if (signal?.aborted) return resolve();
-    const timer = setTimeout(resolve, ms);
+    let keepAliveTimer = null;
+    const cleanup = () => {
+      if (keepAliveTimer !== null) {
+        clearInterval(keepAliveTimer);
+        keepAliveTimer = null;
+      }
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    if (ms > 15000 && typeof chrome?.runtime?.getPlatformInfo === "function") {
+      keepAliveTimer = setInterval(() => {
+        try {
+          chrome.runtime.getPlatformInfo(() => {});
+        } catch (_) {}
+      }, 15000);
+    }
     if (signal) {
       signal.addEventListener(
         "abort",
         () => {
           clearTimeout(timer);
+          cleanup();
           resolve();
         },
         { once: true }
@@ -954,7 +1071,8 @@ async function callLLMSingleAttempt(
     allowReasoningEffort = true,
     temperatureOverride = null,
     minMaxTokens = 0,
-    timeoutMs = 45000
+    timeoutMs = 45000,
+    onUsage = null
   } = attemptOpts;
 
   if (!baseUrl) throw makeLlmError("Base URLが設定されていません", { retryable: false });
@@ -1124,7 +1242,9 @@ async function callLLMSingleAttempt(
     }
 
     try {
-      return parseJsonFromLLM(content);
+      const parsed = parseJsonFromLLM(content);
+      if (onUsage) onUsage(extractTokenUsage("openai", data));
+      return parsed;
     } catch (parseErr) {
       const bumped =
         finishReason === "length"
@@ -1189,7 +1309,9 @@ async function callLLMSingleAttempt(
     const data = await res.json();
     const textPart = (data?.content || []).find((c) => c.type === "text")?.text || "";
     try {
-      return parseJsonFromLLM(textPart);
+      const parsed = parseJsonFromLLM(textPart);
+      if (onUsage) onUsage(extractTokenUsage("anthropic", data));
+      return parsed;
     } catch (parseErr) {
       throw makeLlmError(parseErr?.message || String(parseErr), { retryable: true });
     }
@@ -1255,7 +1377,9 @@ async function callLLMSingleAttempt(
     const textPart =
       data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("\n") || "";
     try {
-      return parseJsonFromLLM(textPart);
+      const parsed = parseJsonFromLLM(textPart);
+      if (onUsage) onUsage(extractTokenUsage("gemini", data));
+      return parsed;
     } catch (parseErr) {
       throw makeLlmError(parseErr?.message || String(parseErr), {
         retryable: true,
@@ -1284,6 +1408,7 @@ async function callLLM(
     ? retryOpts.validateDecision
     : null;
   const onRetry = typeof retryOpts.onRetry === "function" ? retryOpts.onRetry : null;
+  const onUsage = typeof retryOpts.onUsage === "function" ? retryOpts.onUsage : null;
 
   let forceJsonMode = true;
   let allowReasoningEffort = true;
@@ -1306,7 +1431,13 @@ async function callLLM(
         screenshotDataUrl,
         signal,
         maxOutputTokens,
-        { forceJsonMode, allowReasoningEffort, temperatureOverride: attemptTemp, minMaxTokens }
+        {
+          forceJsonMode,
+          allowReasoningEffort,
+          temperatureOverride: attemptTemp,
+          minMaxTokens,
+          onUsage
+        }
       );
       if (validateDecision) {
         const validationErr = validateDecision(parsed);
@@ -2162,7 +2293,7 @@ const STATIC_SYSTEM_PROMPT = [
   'スキーマ:{"reason":"本文や音声根拠と各選択肢の比較(日本語100字以内)","status":"answer"|"next_only"|"completed"|"wait","selectedOptionIds":["opt-0"],"selectValues":[{"id":"sel-0","value":"..."}],"textValues":[{"id":"txt-0","value":"..."}],"clickButtonId":"btn-0"|null}',
   "厳守ルール:",
   "1. 先頭に[共有本文・音声]がある場合は該当箇所の根拠と言い換えを必ず照合し、直感で選ばない。複数空欄がある箇所は[空欄:id]/Q番号の前後文脈のみ参照。",
-  '2. options/selects/空textInputsがあればstatus="answer"。単一選択は1つ、複数選択指示は該当全ID。文字タイル問題(tileCountあり)は全文字を使い切った完成語を"spelledAnswer"に出し全タイルIDを順にselectedOptionIdsへ出力。clickButtonIdはbuttons内から確定/次へ用を選び無ければnull。',
+  '2. options/selects/空textInputsがあればstatus="answer"。単一選択は1つ、複数選択指示は該当全ID。文字タイル問題(tileCountあり)は全文字を使い切った完成語を"spelledAnswer"に出力（selectedOptionIdsは省略可）。clickButtonIdはbuttons内から確定/次へ用を選び無ければnull。',
   '3. 未解答欄が無く進む画面は"next_only"、終了時は"completed"。'
 ].join("\n");
 
@@ -2203,7 +2334,12 @@ function buildPrompts(frameData, settings, alreadyAnsweredCurrentQuestion, allow
 
   const compactOptions = (frameData.options || []).map((o) => {
     const out = { id: o.id, text: o.text };
-    if (o.type && o.type !== "button-choice" && o.type !== "radio") {
+    if (
+      !isLetterTileQuestion &&
+      o.type &&
+      o.type !== "button-choice" &&
+      o.type !== "radio"
+    ) {
       out.type = o.type;
     }
     if (o.checked) out.checked = true;
@@ -2228,9 +2364,13 @@ function buildPrompts(frameData, settings, alreadyAnsweredCurrentQuestion, allow
     ...(t.contextSnippet ? { contextSnippet: t.contextSnippet } : {})
   }));
 
-  const qText = frameData.activeQuestionText || frameData.pageText || "";
+  const rawQText = frameData.activeQuestionText || frameData.pageText || "";
+  const qText = rawQText.replace(
+    /(?:\r?\n)+\s*(?:確認|確認する|解答|解答する|回答|回答する|チェック|提出|提出する)\s*$/i,
+    ""
+  );
   const rawShared = (frameData.sharedContext || "").trim();
-  const useSharedPrefix = rawShared && rawShared !== qText.trim();
+  const useSharedPrefix = rawShared && rawShared !== rawQText.trim();
 
   const payload = {
     ...(alreadyAnsweredCurrentQuestion ? { alreadyAnswered: true } : {}),
@@ -3042,6 +3182,7 @@ async function executeSingleStep(tabId, isAutoMode) {
       frameData.selects.length > 0 ||
       (frameData.textInputs || []).length > 0)
   ) {
+    await ensureTranscriptCacheLoaded();
     const primaryAudioUrl = frameData.activeAudioUrl || "";
     const questionSpecificId = (
       frameData.questionBaseKey ||
@@ -3056,6 +3197,7 @@ async function executeSingleStep(tabId, isAutoMode) {
 
     if (cachedTranscript) {
       currentAudioTranscript = cachedTranscript;
+      if (session.usage) session.usage.audioCacheHits += 1;
       appendLog(session, `AUDIO: キャッシュ済み文字起こしを使用 (${cachedTranscript.length}文字)`);
       if (!(frameData.sharedContext || "").includes(cachedTranscript)) {
         frameData.sharedContext = [
@@ -3096,6 +3238,7 @@ async function executeSingleStep(tabId, isAutoMode) {
               (audioHash ? audioTranscriptCache.get(audioHash) : null);
             if (existingCached) {
               currentAudioTranscript = existingCached;
+              if (session.usage) session.usage.audioCacheHits += 1;
               audioTranscriptCache.set(pageCacheKey, existingCached);
               appendLog(
                 session,
@@ -3109,6 +3252,7 @@ async function executeSingleStep(tabId, isAutoMode) {
                 }で文字起こし中...`
               );
               const candidateOptionTexts = (frameData.options || []).map((o) => o.text);
+              if (session.usage) session.usage.sttCalls += 1;
               const transcript = await transcribeAudioBase64(
                 sttCreds,
                 audioRes,
@@ -3121,9 +3265,14 @@ async function executeSingleStep(tabId, isAutoMode) {
               );
               if (transcript) {
                 currentAudioTranscript = transcript;
-                if (isRealAudioUrl) audioTranscriptCache.set(audioRes.url, transcript);
-                if (audioHash) audioTranscriptCache.set(audioHash, transcript);
-                audioTranscriptCache.set(pageCacheKey, transcript);
+                await persistTranscriptKeys(
+                  [
+                    isRealAudioUrl ? audioRes.url : "",
+                    audioHash || "",
+                    pageCacheKey
+                  ],
+                  transcript
+                );
                 appendLog(
                   session,
                   `AUDIO: 文字起こし完了 (${transcript.length}文字): "${transcript.slice(0, 80)}"`
@@ -3204,14 +3353,12 @@ async function executeSingleStep(tabId, isAutoMode) {
       const outOpts = Array.isArray(dec.selectedOptionIds) ? dec.selectedOptionIds.filter(Boolean) : [];
       const outSels = Array.isArray(dec.selectValues) ? dec.selectValues.filter((s) => s?.id) : [];
       const outTxts = Array.isArray(dec.textValues) ? dec.textValues.filter((t) => t?.id && String(t.value ?? "").trim() !== "") : [];
-      if (hasOpts && outOpts.length === 0) return "AIの選択回答が空でした (selectedOptionIds=[])";
-      if (hasSels && outSels.length === 0) return "AIのselect回答が空でした (selectValues=[])";
-      if (hasEmptyTxts && outTxts.length === 0) return "AIのテキスト入力回答が空でした (textValues=[])";
 
       const isTilePool =
         hasOpts &&
         frameData.options.length >= 3 &&
         frameData.options.every((o) => o.type === "tile-order" || (o.text || "").length <= 2);
+      let tileMappedIds = null;
       if (isTilePool && typeof dec.spelledAnswer === "string" && dec.spelledAnswer.trim()) {
         const { mappedIds, unmatchedChars } = mapSpelledAnswerToOptionIds(
           dec.spelledAnswer,
@@ -3227,7 +3374,16 @@ async function executeSingleStep(tabId, isAutoMode) {
         if (clearlyTilePuzzle && mappedIds.length < frameData.options.length) {
           return `文字タイル数が一致しません (${mappedIds.length}/${frameData.options.length}文字使用)`;
         }
+        if (mappedIds.length > 0) {
+          tileMappedIds = mappedIds;
+        }
       }
+
+      if (hasOpts && outOpts.length === 0 && !tileMappedIds) {
+        return "AIの選択回答が空でした (selectedOptionIds=[])";
+      }
+      if (hasSels && outSels.length === 0) return "AIのselect回答が空でした (selectValues=[])";
+      if (hasEmptyTxts && outTxts.length === 0) return "AIのテキスト入力回答が空でした (textValues=[])";
     }
     if (dec.status === "next_only" && (frameData.buttons || []).length > 0 && !dec.clickButtonId) {
       return "AIのボタン選択が空でした (clickButtonId=null)";
@@ -3246,6 +3402,7 @@ async function executeSingleStep(tabId, isAutoMode) {
     {
       maxAttempts: isAutoMode ? 4 : 2,
       validateDecision,
+      onUsage: (u) => recordSessionUsage(session, u),
       onRetry: async ({ attempt, maxAttempts, waitMs, reason }) => {
         const sec = Math.max(1, Math.round(waitMs / 1000));
         session.phase = `⏳ AI応答エラーのため待機後リトライ (${attempt}/${maxAttempts - 1}, ${sec}秒後)...`;
@@ -3405,6 +3562,7 @@ async function buildDebugReport(tabId) {
       solvedCount: session.solvedCount,
       stepCount: session.stepCount,
       answeredKeysInMemoryCount: session.answeredBlockKeys.size,
+      usage: session.usage ? { ...session.usage } : createEmptyUsage(),
       error: session.error
     },
     frameScan: bestFrame
@@ -3859,7 +4017,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             sttCreds,
             audioRes,
             candidateOptions,
-            null
+            null,
+            async (step) => {
+              chrome.runtime.sendMessage({ type: "ELK_STT_TEST_PROGRESS", step }).catch(() => {});
+            }
           );
           const elapsedMs = Date.now() - t0;
           const displayTranscript =
@@ -3927,6 +4088,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           resetPerLessonState(s);
           s.lastReason = "";
           s.lastAnswerSummary = "";
+          s.usage = createEmptyUsage();
           s.error = null;
           s.logs = [];
           await broadcastStatus(senderTabId);

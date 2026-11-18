@@ -1315,11 +1315,17 @@
       /\b00:\d{2}\b[\s\S]{0,120}\b0\d:\d{2}\b/.test(activeQText) ||
       /(do you hear|listen to|音声を聞いて|聞いて.*答え)/i.test(activeQText);
 
-    const sharedAreaHasAudio =
+    const sharedFiberHrefNow = document.documentElement?.getAttribute("data-elk-shared-fiber-href");
+    const hasVisibleAudioWidget =
+      Boolean(document.querySelector("audio, video")) ||
+      collectCircularPlayButtons().length > 0 ||
       /\b00:\d{2}\b[\s\S]{0,120}\b0\d:\d{2}\b/.test(sharedText) ||
-      /(音声を聞いて|聞いて.*答え|do you hear|listen to|[<＜]音声|リスニング|listening)/i.test(
-        sharedText
-      );
+      (sharedFiberHrefNow === location.href &&
+        Boolean(document.documentElement?.getAttribute("data-elk-shared-fiber-audio")));
+
+    const sharedAreaHasAudio =
+      hasVisibleAudioWidget ||
+      /(音声を聞いて|聞いて.*答え|do you hear|listen to the audio)/i.test(sharedText);
 
     // Resolve the exact audio URL for the active question block
     let activeAudioUrl = null;
@@ -4215,6 +4221,15 @@
           overflow: hidden;
           text-overflow: ellipsis;
         }
+        .usage-line {
+          color: #94a3b8;
+          font-size: 10.5px;
+          display: none;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .usage-line.visible { display: block; }
         .answer-box {
           background: rgba(30, 41, 59, 0.7);
           border: 1px solid rgba(148, 163, 184, 0.15);
@@ -4331,6 +4346,7 @@
         </div>
         <div class="body">
           <div class="phase" id="phaseText">待機中</div>
+          <div class="usage-line" id="usageLine"></div>
           <div class="answer-box" id="answerBox">
             <div class="answer-main" id="answerMain"></div>
             <div class="answer-reason" id="answerReason"></div>
@@ -4363,6 +4379,7 @@
     const copyDebugBtn = shadow.getElementById("copyDebugBtn");
     const minBtn = shadow.getElementById("minBtn");
     const phaseText = shadow.getElementById("phaseText");
+    const usageLine = shadow.getElementById("usageLine");
     const answerBox = shadow.getElementById("answerBox");
     const answerMain = shadow.getElementById("answerMain");
     const answerReason = shadow.getElementById("answerReason");
@@ -4596,6 +4613,28 @@
         statusDot.className = "dot" + (state.error ? " error" : isRunning ? " running" : "");
         countBadge.textContent = `${state.solvedCount || 0}問`;
         phaseText.textContent = state.phase || (isRunning ? "実行中..." : "待機中");
+
+        const u = state.usage;
+        if (u && (u.llmCalls > 0 || u.sttCalls > 0 || u.audioCacheHits > 0)) {
+          const totalTok = (u.promptTokens || 0) + (u.completionTokens || 0);
+          const tokStr = totalTok >= 1000 ? `${(totalTok / 1000).toFixed(1)}k` : `${totalTok}`;
+          const cachePct =
+            u.promptTokens > 0 ? Math.round(((u.cachedTokens || 0) / u.promptTokens) * 100) : 0;
+          const parts = [];
+          if (u.llmCalls > 0) {
+            parts.push(
+              `AI ${u.llmCalls}回 · ${tokStr} tok${cachePct > 0 ? ` (キャッシュ${cachePct}%)` : ""}`
+            );
+          }
+          if (u.sttCalls > 0 || u.audioCacheHits > 0) {
+            parts.push(`STT ${u.sttCalls || 0} (Hit ${u.audioCacheHits || 0})`);
+          }
+          usageLine.textContent = parts.join(" · ");
+          usageLine.classList.add("visible");
+        } else {
+          usageLine.textContent = "";
+          usageLine.classList.remove("visible");
+        }
 
         if (state.lastAnswerSummary || state.lastReason) {
           answerBox.classList.add("visible");
