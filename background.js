@@ -126,6 +126,7 @@ function getOrCreateSession(tabId) {
       lastAnsweredBaseKey: null,
       lastAnsweredAt: 0,
       waitedForSameKey: false,
+      lastClearedTileHash: null,
       courseHomeUrl: "",
       lastStartedCourseLessonKey: "",
       attemptedCourseLessonKeys: new Set(),
@@ -217,6 +218,7 @@ function resetPerLessonState(session) {
   session.recordingWaitOnce = false;
   session.waitedForSameKey = false;
   session.lastAnsweredBaseKey = null;
+  session.lastClearedTileHash = null;
 }
 
 async function waitForTabUrlTransition(tabId, checkFn, signal, maxWaitMs = 2200) {
@@ -894,21 +896,43 @@ function parseJsonFromLLM(rawText) {
   }
 }
 
-function parseRetryAfterMs(res) {
+function parseRetryAfterMs(res, errText = "") {
   try {
     const raw = res?.headers?.get?.("retry-after");
-    if (!raw) return 0;
-    const secs = Number(raw);
-    if (!Number.isNaN(secs) && secs > 0) return Math.min(35000, Math.round(secs * 1000));
+    if (raw) {
+      const secs = Number(raw);
+      if (!Number.isNaN(secs) && secs > 0) return Math.min(45000, Math.round(secs * 1000));
+    }
+  } catch (_) {}
+  try {
+    const textMatch = String(errText || "").match(/try again in\s+([\d.]+)\s*(ms|s)\b/i);
+    if (textMatch) {
+      const val = Number(textMatch[1]);
+      if (!Number.isNaN(val) && val > 0) {
+        const ms = textMatch[2].toLowerCase() === "ms" ? val : val * 1000;
+        return Math.min(45000, Math.round(ms + 400));
+      }
+    }
   } catch (_) {}
   return 0;
 }
 
-function makeLlmError(message, { retryable = true, retryAfterMs = 0, disableJsonMode = false } = {}) {
+function makeLlmError(
+  message,
+  {
+    retryable = true,
+    retryAfterMs = 0,
+    disableJsonMode = false,
+    disableReasoningEffort = false,
+    bumpMinMaxTokens = 0
+  } = {}
+) {
   const err = new Error(message);
   err.retryable = retryable;
   err.retryAfterMs = retryAfterMs;
   err.disableJsonMode = disableJsonMode;
+  err.disableReasoningEffort = disableReasoningEffort;
+  err.bumpMinMaxTokens = bumpMinMaxTokens;
   return err;
 }
 
@@ -927,6 +951,7 @@ async function callLLMSingleAttempt(
   const model = (settings.model || "").trim();
   const {
     forceJsonMode = true,
+    allowReasoningEffort = true,
     temperatureOverride = null,
     minMaxTokens = 0,
     timeoutMs = 45000
@@ -955,10 +980,18 @@ async function callLLMSingleAttempt(
         ]
       : userPrompt;
 
-    const isReasoner = /reasoner|deepseek-r1|qwq|^o[134](?:-|$)|\bgpt-5/i.test(model);
-    const effectiveMaxTokens = Math.max(Number(maxOutputTokens) || 0, Number(minMaxTokens) || 0);
+    const isStrictReasoner = /reasoner|deepseek-r1|qwq|^o[134](?:-|$)|\bgpt-5/i.test(model);
+    const isThinkingModel =
+      isStrictReasoner || /\bgpt-oss\b|qwen3|thinking|gemini-2\.[59]|gemini-3/i.test(model);
+    const supportsLowEffort = /\bgpt-oss\b|gemini-2\.[59]|gemini-3/i.test(model);
+    const thinkingFloor = isThinkingModel ? 2048 : 0;
+    const effectiveMaxTokens = Math.max(
+      Number(maxOutputTokens) || 0,
+      Number(minMaxTokens) || 0,
+      thinkingFloor
+    );
 
-    const buildBody = (useJsonMode) => {
+    const buildBody = (useJsonMode, useReasoningEffort) => {
       const body = {
         model,
         messages: [
@@ -966,24 +999,31 @@ async function callLLMSingleAttempt(
           { role: "user", content: userContent }
         ]
       };
-      if (!isReasoner) {
+      if (!isStrictReasoner) {
         body.temperature = temperatureOverride != null ? temperatureOverride : 0.0;
         if (effectiveMaxTokens > 0) {
-          body.max_tokens = useJsonMode ? effectiveMaxTokens : Math.max(effectiveMaxTokens, 1100);
+          body.max_tokens = useJsonMode
+            ? effectiveMaxTokens
+            : Math.max(effectiveMaxTokens, 1400);
         }
       }
-      if (useJsonMode && !isReasoner) {
+      if (useReasoningEffort && supportsLowEffort) {
+        body.reasoning_effort = "low";
+      }
+      if (useJsonMode && !isStrictReasoner) {
         body.response_format = { type: "json_object" };
       }
       return body;
     };
 
+    let currentJsonMode = forceJsonMode;
+    let currentReasoningEffort = allowReasoningEffort;
     let res = await fetchWithTimeout(
       endpoint,
       {
         method: "POST",
         headers,
-        body: JSON.stringify(buildBody(forceJsonMode))
+        body: JSON.stringify(buildBody(currentJsonMode, currentReasoningEffort))
       },
       timeoutMs,
       signal
@@ -993,7 +1033,7 @@ async function callLLMSingleAttempt(
       const discovered = await discoverGeminiModels(apiKey, signal).catch(() => null);
       if (discovered && discovered.models.length > 0) {
         for (const fallbackModel of discovered.models.slice(0, 3)) {
-          const retryBody = buildBody(forceJsonMode);
+          const retryBody = buildBody(currentJsonMode, currentReasoningEffort);
           retryBody.model = fallbackModel;
           res = await fetchWithTimeout(
             endpoint,
@@ -1010,15 +1050,22 @@ async function callLLMSingleAttempt(
       }
     }
 
-    if (res.status === 400 && forceJsonMode) {
+    if (res.status === 400 && (currentJsonMode || currentReasoningEffort)) {
       const errPreview = await res.clone().text().catch(() => "");
-      if (/response_format|json_object|json_validate_failed|Failed to generate JSON/i.test(errPreview)) {
+      const badJsonMode =
+        currentJsonMode &&
+        /response_format|json_object|json_validate_failed|Failed to generate JSON/i.test(errPreview);
+      const badReasoningEffort =
+        currentReasoningEffort && /reasoning_effort/i.test(errPreview);
+      if (badJsonMode || badReasoningEffort) {
+        if (badJsonMode) currentJsonMode = false;
+        if (badReasoningEffort) currentReasoningEffort = false;
         res = await fetchWithTimeout(
           endpoint,
           {
             method: "POST",
             headers,
-            body: JSON.stringify(buildBody(false))
+            body: JSON.stringify(buildBody(currentJsonMode, currentReasoningEffort))
           },
           timeoutMs,
           signal
@@ -1028,25 +1075,58 @@ async function callLLMSingleAttempt(
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      const retryAfterMs = parseRetryAfterMs(res);
+      const retryAfterMs = parseRetryAfterMs(res, errText);
       const isAuthErr = res.status === 401 || res.status === 403;
       const isJsonValidate = /json_validate_failed|Failed to generate JSON|response_format/i.test(errText);
       const isTransientStatus = res.status === 408 || res.status === 429 || res.status >= 500 || isJsonValidate;
       throw makeLlmError(`APIエラー (${res.status}): ${errText.slice(0, 200)}`, {
         retryable: !isAuthErr && isTransientStatus,
         retryAfterMs,
-        disableJsonMode: isJsonValidate
+        disableJsonMode: isJsonValidate,
+        disableReasoningEffort: /reasoning_effort/i.test(errText)
       });
     }
 
     const data = await res.json();
-    const content = data?.choices?.[0]?.message?.content || "";
+    const choice = data?.choices?.[0];
+    const content = choice?.message?.content || "";
+    const finishReason = String(choice?.finish_reason || "");
+    const reasoningLen = String(
+      choice?.message?.reasoning || choice?.message?.reasoning_content || ""
+    ).length;
+
+    if (!String(content).trim()) {
+      const refusal = String(choice?.message?.refusal || "").trim();
+      const bumped =
+        finishReason === "length" || reasoningLen > 0
+          ? Math.min(4096, Math.max(2400, effectiveMaxTokens * 2 || 2400))
+          : 0;
+      const suffixParts = [];
+      if (finishReason) suffixParts.push(`finish=${finishReason}`);
+      if (reasoningLen > 0) suffixParts.push(`reasoning=${reasoningLen}文字`);
+      const detail = suffixParts.length > 0 ? ` (${suffixParts.join(", ")})` : "";
+      throw makeLlmError(
+        refusal ? `AIが応答を拒否しました: ${refusal.slice(0, 120)}` : `AIからの応答が空でした${detail}`,
+        {
+          retryable: true,
+          disableJsonMode: true,
+          disableReasoningEffort: !currentReasoningEffort,
+          bumpMinMaxTokens: bumped
+        }
+      );
+    }
+
     try {
       return parseJsonFromLLM(content);
     } catch (parseErr) {
+      const bumped =
+        finishReason === "length"
+          ? Math.min(4096, Math.max(2400, effectiveMaxTokens * 2 || 2400))
+          : 0;
       throw makeLlmError(parseErr?.message || String(parseErr), {
         retryable: true,
-        disableJsonMode: true
+        disableJsonMode: true,
+        bumpMinMaxTokens: bumped
       });
     }
   }
@@ -1199,6 +1279,8 @@ async function callLLM(
   const onRetry = typeof retryOpts.onRetry === "function" ? retryOpts.onRetry : null;
 
   let forceJsonMode = true;
+  let allowReasoningEffort = true;
+  let dynamicMinMaxTokens = 0;
   let lastErr = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -1207,7 +1289,7 @@ async function callLLM(
     }
 
     const attemptTemp = attempt === 1 ? null : Math.min(0.45, (attempt - 1) * 0.15);
-    const minMaxTokens = attempt === 1 ? 0 : 1200;
+    const minMaxTokens = Math.max(dynamicMinMaxTokens, attempt === 1 ? 0 : 1400);
 
     try {
       const parsed = await callLLMSingleAttempt(
@@ -1217,7 +1299,7 @@ async function callLLM(
         screenshotDataUrl,
         signal,
         maxOutputTokens,
-        { forceJsonMode, temperatureOverride: attemptTemp, minMaxTokens }
+        { forceJsonMode, allowReasoningEffort, temperatureOverride: attemptTemp, minMaxTokens }
       );
       if (validateDecision) {
         const validationErr = validateDecision(parsed);
@@ -1233,6 +1315,12 @@ async function callLLM(
 
       if (err?.disableJsonMode) {
         forceJsonMode = false;
+      }
+      if (err?.disableReasoningEffort) {
+        allowReasoningEffort = false;
+      }
+      if (Number(err?.bumpMinMaxTokens) > dynamicMinMaxTokens) {
+        dynamicMinMaxTokens = Math.min(4096, Number(err.bumpMinMaxTokens));
       }
 
       const baseDelay = backoffSchedule[Math.min(attempt - 1, backoffSchedule.length - 1)] || 5000;
@@ -2071,6 +2159,35 @@ const STATIC_SYSTEM_PROMPT = [
   '3. 未解答欄が無く進む画面は"next_only"、終了時は"completed"。'
 ].join("\n");
 
+function mapSpelledAnswerToOptionIds(spelledAnswer, options) {
+  const cleanSpelled = String(spelledAnswer || "").replace(/\s+/g, "");
+  const usedIds = new Set();
+  const mappedIds = [];
+  const unmatchedChars = [];
+  let i = 0;
+  while (i < cleanSpelled.length) {
+    let matchedOpt = null;
+    for (const len of [2, 1]) {
+      if (i + len > cleanSpelled.length) continue;
+      const sub = cleanSpelled.slice(i, i + len).toLowerCase();
+      matchedOpt = (options || []).find(
+        (o) => !usedIds.has(o.id) && (o.text || "").toLowerCase() === sub
+      );
+      if (matchedOpt) {
+        usedIds.add(matchedOpt.id);
+        mappedIds.push(matchedOpt.id);
+        i += len;
+        break;
+      }
+    }
+    if (!matchedOpt) {
+      unmatchedChars.push(cleanSpelled[i]);
+      i += 1;
+    }
+  }
+  return { mappedIds, unmatchedChars };
+}
+
 function buildPrompts(frameData, settings, alreadyAnsweredCurrentQuestion, allowGlobalSubmit) {
   const isLetterTileQuestion =
     Array.isArray(frameData.options) &&
@@ -2129,7 +2246,7 @@ function buildPrompts(frameData, settings, alreadyAnsweredCurrentQuestion, allow
   userSections.push(`問題JSON:${JSON.stringify(payload)}`);
 
   const isBatchInputs = compactTexts.length >= 2 || compactSelects.length >= 2;
-  const maxOutputTokens = isBatchInputs ? 1000 : 600;
+  const maxOutputTokens = isBatchInputs ? 1000 : isLetterTileQuestion ? 900 : 600;
 
   return {
     systemPrompt: STATIC_SYSTEM_PROMPT,
@@ -2162,7 +2279,8 @@ async function executeSingleStep(tabId, isAutoMode) {
     );
   }
 
-  const { frameId, data: frameData } = bestFrame;
+  const { frameId, data: initialFrameData } = bestFrame;
+  let frameData = initialFrameData;
 
   // Clear per-page answered/played memory if URL changed
   if (frameData.url && session.lastPageUrl && frameData.url !== session.lastPageUrl) {
@@ -2177,6 +2295,7 @@ async function executeSingleStep(tabId, isAutoMode) {
     session.courseWaitCount = 0;
     session.courseScrolledOnce = false;
     session.courseReturnAttempts = 0;
+    session.lastClearedTileHash = null;
     if (prevLessonId !== nextLessonId) {
       session.lessonStepCount = 0;
     }
@@ -2851,6 +2970,48 @@ async function executeSingleStep(tabId, isAutoMode) {
 
   const allowGlobalSubmit = qSummary.activeCount <= 1 && qSummary.lockedCount === 0;
 
+  // Reset partial/stale clicked letter tiles (e.g. "Never i _ _ _ _ _ _ _") via backspace before calling LLM
+  if (
+    frameData.isTileQuestion &&
+    frameData.tilePartialUsedCount > 0 &&
+    frameData.hasTileBackspace &&
+    !submitNavBtn &&
+    !nextNavBtn &&
+    session.lastClearedTileHash !== frameData.stateHash
+  ) {
+    session.lastClearedTileHash = frameData.stateHash;
+    session.phase = `🔄 途中入力タイル (${frameData.tilePartialUsedCount}枚) をリセット中...`;
+    await broadcastStatus(tabId);
+    const clearRes = await chrome.tabs.sendMessage(
+      tabId,
+      {
+        type: "ELK_EXECUTE_ACTION",
+        payload: {
+          status: "clear_partial_tiles",
+          clickCount: frameData.tilePartialUsedCount + 2
+        }
+      },
+      { frameId }
+    );
+    appendLog(
+      session,
+      `TILE CLEAR: ${(clearRes?.actionsTaken || ["backspace reset"]).join(" | ")}`
+    );
+    if (isAutoMode) {
+      return { done: false, customNextDelayMs: 280 };
+    }
+    await sleep(280, signal);
+    const rescanned = await scanBestFrame(
+      tabId,
+      Array.from(session.answeredBlockKeys),
+      false,
+      Array.from(session.playedMediaCardKeys)
+    );
+    if (rescanned?.data) {
+      frameData = rescanned.data;
+    }
+  }
+
   // --- Audio / Listening Task Handling ---
   let currentAudioTranscript = "";
   let audioWarningNote = "";
@@ -3039,6 +3200,27 @@ async function executeSingleStep(tabId, isAutoMode) {
       if (hasOpts && outOpts.length === 0) return "AIの選択回答が空でした (selectedOptionIds=[])";
       if (hasSels && outSels.length === 0) return "AIのselect回答が空でした (selectValues=[])";
       if (hasEmptyTxts && outTxts.length === 0) return "AIのテキスト入力回答が空でした (textValues=[])";
+
+      const isTilePool =
+        hasOpts &&
+        frameData.options.length >= 3 &&
+        frameData.options.every((o) => o.type === "tile-order" || (o.text || "").length <= 2);
+      if (isTilePool && typeof dec.spelledAnswer === "string" && dec.spelledAnswer.trim()) {
+        const { mappedIds, unmatchedChars } = mapSpelledAnswerToOptionIds(
+          dec.spelledAnswer,
+          frameData.options
+        );
+        if (unmatchedChars.length > 0) {
+          return `文字タイルと一致しない文字を含んでいます (${dec.spelledAnswer}: 不足=${unmatchedChars.join(",")})`;
+        }
+        const clearlyTilePuzzle =
+          Boolean(frameData.isTileQuestion) &&
+          (frameData.options.every((o) => (o.text || "").length === 1) ||
+            /(並べ替|文字を|tile|_ _)/i.test(`${frameData.activeQuestionText || ""} ${frameData.sharedContext || ""}`));
+        if (clearlyTilePuzzle && mappedIds.length < frameData.options.length) {
+          return `文字タイル数が一致しません (${mappedIds.length}/${frameData.options.length}文字使用)`;
+        }
+      }
     }
     if (dec.status === "next_only" && (frameData.buttons || []).length > 0 && !dec.clickButtonId) {
       return "AIのボタン選択が空でした (clickButtonId=null)";
@@ -3104,28 +3286,7 @@ async function executeSingleStep(tabId, isAutoMode) {
     frameData.options.every((o) => o.type === "tile-order" || (o.text || "").length <= 2);
 
   if (isLetterTileQuestion && typeof decision.spelledAnswer === "string" && decision.spelledAnswer.trim()) {
-    const cleanSpelled = decision.spelledAnswer.replace(/\s+/g, "");
-    const usedIds = new Set();
-    const mappedIds = [];
-    let i = 0;
-    while (i < cleanSpelled.length) {
-      let matchedOpt = null;
-      // Try 2-char tile first if any exists, then 1-char tile (case-insensitive)
-      for (const len of [2, 1]) {
-        if (i + len > cleanSpelled.length) continue;
-        const sub = cleanSpelled.slice(i, i + len).toLowerCase();
-        matchedOpt = frameData.options.find(
-          (o) => !usedIds.has(o.id) && (o.text || "").toLowerCase() === sub
-        );
-        if (matchedOpt) {
-          usedIds.add(matchedOpt.id);
-          mappedIds.push(matchedOpt.id);
-          i += len;
-          break;
-        }
-      }
-      if (!matchedOpt) break;
-    }
+    const { mappedIds } = mapSpelledAnswerToOptionIds(decision.spelledAnswer, frameData.options);
     if (mappedIds.length >= selectedOptionIds.length && mappedIds.length > 0) {
       selectedOptionIds = mappedIds;
       appendLog(

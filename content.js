@@ -1438,7 +1438,7 @@
   }
 
   function isPlayIconSymbolText(t) {
-    return !t || /^[▶►▷⏸❚❚II\s]+$/i.test(t);
+    return !t || /^[▶►▷⏸❚|│┃\s]+$/.test(t) || /^(?:II|\|\|)$/.test(t);
   }
 
   function hasGraphicOrCssPlayIndicator(el) {
@@ -1532,9 +1532,21 @@
       const t = normalizeText(el.innerText || el.textContent || "");
       if (t.length > 0 && MEDIA_CONTROL_REGEX.test(t)) continue;
       if (t.length > 4 || !isPlayIconSymbolText(t)) continue;
+      if (t.length === 1 && /^[a-z0-9]$/i.test(t)) continue;
+
+      // Never treat buttons inside a letter-tile grid (>=3 short 1-2 char sibling buttons) as play buttons
+      const parentEl = el.parentElement;
+      if (parentEl && parentEl.tagName !== "BODY") {
+        const siblingShortBtns = Array.from(parentEl.children).filter((ch) => {
+          if (ch.tagName !== "BUTTON" && ch.getAttribute("role") !== "button") return false;
+          const ct = normalizeText(ch.innerText || ch.textContent || "");
+          return ct.length >= 1 && ct.length <= 2;
+        });
+        if (siblingShortBtns.length >= 3) continue;
+      }
 
       const aria = (el.getAttribute("aria-label") || el.getAttribute("title") || "").toLowerCase();
-      if (/(5s|10s|rewind|replay|speed|倍速|bookmark|favorite|hint|close|閉じる)/i.test(aria)) continue;
+      if (/(5s|10s|rewind|replay|speed|倍速|bookmark|favorite|hint|close|閉じる|backspace|delete|erase|clear|消去|削除)/i.test(aria)) continue;
 
       const vis = inspectElementVisualState(el);
       if (!vis.visible) continue;
@@ -1584,6 +1596,22 @@
           !hasPaleParentBar
         ) {
           continue;
+        }
+        // Reject backspace [⌫] SVG icon buttons sitting inside letter-tile puzzle cards
+        const interactionAncestor = el.closest ? el.closest('[id^="interaction-"]') : null;
+        if (interactionAncestor && !/(play|pause|再生|一時停止)/i.test(aria)) {
+          const shortTileBtns = Array.from(interactionAncestor.querySelectorAll("button")).filter((b) => {
+            const bt = normalizeText(b.innerText || b.textContent || "");
+            return bt.length >= 1 && bt.length <= 2;
+          });
+          if (shortTileBtns.length >= 3) {
+            const cardText = interactionAncestor.innerText || interactionAncestor.textContent || "";
+            const cardHasTimeOrAudio =
+              Boolean(interactionAncestor.querySelector("audio")) || /\b0\d:\d{2}\b/.test(cardText);
+            if (!cardHasTimeOrAudio && !isBlueSurface && !isOrangeSurface) {
+              continue;
+            }
+          }
         }
       } else {
         // Wide bar play button (e.g., full-width blue footer strip on flashcards)
@@ -2691,8 +2719,12 @@
     const options = [];
     let optIndex = 0;
 
+    let isTileBlock = false;
+    let tilePartialUsedCount = 0;
+    let hasTileBackspace = false;
+
     if (targetBlock) {
-      const isTileBlock =
+      isTileBlock =
         targetBlock.rawItems.length >= 3 &&
         targetBlock.rawItems.every((it) => (it.text || "").length <= 2);
 
@@ -2724,8 +2756,22 @@
           type: isTileBlock ? "tile-order" : item.choiceType,
           text: item.text,
           checked: isTileBlock ? false : item.checked,
-          disabled: false
+          disabled: isTileBlock ? Boolean(item.inactive) : false
         });
+      }
+
+      if (isTileBlock) {
+        tilePartialUsedCount = targetBlock.rawItems.filter((it) => it.inactive).length;
+        if (tilePartialUsedCount > 0) {
+          const scope =
+            targetBlock.cardEl && targetBlock.cardEl !== document.body
+              ? targetBlock.cardEl
+              : targetBlock.container;
+          const tileElSet = new Set(
+            targetBlock.rawItems.map((it) => it.clickTarget).filter(Boolean)
+          );
+          hasTileBackspace = Boolean(findTileBackspaceButton(scope, tileElSet));
+        }
       }
     }
 
@@ -3337,6 +3383,9 @@
       courseGoalDone,
       courseReturnBtn,
       questionBaseKey,
+      isTileQuestion: isTileBlock,
+      tilePartialUsedCount,
+      hasTileBackspace,
       mediaCards: mediaCardsSummary,
       stateHash
     };
@@ -3487,6 +3536,66 @@
 
   function delay(ms) {
     return new Promise((r) => setTimeout(r, ms));
+  }
+
+  function findTileBackspaceButton(scope, excludedTileSet = null) {
+    if (!scope) return null;
+    const allBtns = scope.querySelectorAll('button, [role="button"]');
+    for (const b of allBtns) {
+      if (isInsideHud(b)) continue;
+      if (excludedTileSet && excludedTileSet.has(b)) continue;
+      const t = normalizeText(b.innerText || b.textContent || "");
+      const aria = (b.getAttribute("aria-label") || b.getAttribute("title") || "").toLowerCase();
+      const cls = typeof b.className === "string" ? b.className.toLowerCase() : "";
+      if (/(play|pause|再生|一時停止)/i.test(aria) || /\bplay\b/.test(cls)) continue;
+      const looksLikeBackspace =
+        (t.length === 0 && Boolean(b.querySelector("svg, i, img"))) ||
+        /^[⌫←✕✖]$/u.test(t) ||
+        /(backspace|delete|erase|clear|消去|削除)/i.test(aria);
+      if (!looksLikeBackspace) continue;
+      const vis = inspectElementVisualState(b);
+      if (!vis.visible || vis.inactive) continue;
+      if (vis.rect.width >= 18 && vis.rect.width <= 110 && vis.rect.height >= 18 && vis.rect.height <= 80) {
+        return b;
+      }
+    }
+    return null;
+  }
+
+  async function clearPartialTilesOnBlock(targetBlock, maxClicks, actionsTaken) {
+    if (!targetBlock) return 0;
+    const scope =
+      targetBlock.cardEl && targetBlock.cardEl !== document.body
+        ? targetBlock.cardEl
+        : targetBlock.container;
+    if (!scope) return 0;
+    const tileElSet = new Set(
+      (targetBlock.rawItems || []).map((it) => it.clickTarget).filter(Boolean)
+    );
+    const backspaceBtn = findTileBackspaceButton(scope, tileElSet);
+    if (!backspaceBtn) return 0;
+
+    let clickedCount = 0;
+    const limit = Math.max(1, Number(maxClicks) || 1);
+    for (let k = 0; k < limit; k++) {
+      if (!document.contains(backspaceBtn)) break;
+      const vis = inspectElementVisualState(backspaceBtn);
+      if (!vis.visible || vis.inactive) break;
+      simulateRealisticClick(backspaceBtn);
+      clickedCount += 1;
+      await delay(45);
+      // Stop early once all tiles become active again
+      const stillInactive = (targetBlock.rawItems || []).some((it) => {
+        const el = it.clickTarget;
+        return el && document.contains(el) && inspectElementVisualState(el).inactive;
+      });
+      if (!stillInactive) break;
+    }
+    if (clickedCount > 0) {
+      actionsTaken.push(`cleared partial tiles via backspace (${clickedCount}x)`);
+      await delay(80);
+    }
+    return clickedCount;
   }
 
   async function executeAction(payload) {
@@ -3669,6 +3778,17 @@
       return { ok: true, stillPlaying, actionsTaken };
     }
 
+    if (status === "clear_partial_tiles") {
+      const tb = lastScanContext.targetBlock;
+      const usedCount = tb
+        ? (tb.rawItems || []).filter((it) => inspectElementVisualState(it.clickTarget).inactive).length
+        : 0;
+      const targetClicks = Math.max(usedCount + 2, Number(payload?.clickCount) || 1);
+      await clearPartialTilesOnBlock(tb, targetClicks, actionsTaken);
+      console.log("[ELK] Exec:", actionsTaken);
+      return { ok: true, actionsTaken };
+    }
+
     const preExistingButtonElements = new Set();
     for (const [, item] of elementRegistry.entries()) {
       if (item.kind === "button" && item.clickTarget) {
@@ -3687,29 +3807,7 @@
       const tb = lastScanContext.targetBlock;
       const usedCount = (tb.rawItems || []).filter((it) => inspectElementVisualState(it.clickTarget).inactive).length;
       if (usedCount > 0) {
-        const scope = tb.cardEl && tb.cardEl !== document.body ? tb.cardEl : tb.container;
-        if (scope) {
-          const allBtns = scope.querySelectorAll('button, [role="button"]');
-          let backspaceBtn = null;
-          for (const b of allBtns) {
-            const t = normalizeText(b.innerText || b.textContent || "");
-            if (t.length === 0 && b.querySelector("svg")) {
-              const r = b.getBoundingClientRect();
-              if (r.width >= 20 && r.width <= 90 && r.height >= 20 && r.height <= 75) {
-                backspaceBtn = b;
-                break;
-              }
-            }
-          }
-          if (backspaceBtn) {
-            for (let k = 0; k < usedCount + 2; k++) {
-              simulateRealisticClick(backspaceBtn);
-              await delay(45);
-            }
-            actionsTaken.push(`cleared ${usedCount} partial tiles via backspace`);
-            await delay(80);
-          }
-        }
+        await clearPartialTilesOnBlock(tb, usedCount + 2, actionsTaken);
       }
     }
 
