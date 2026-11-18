@@ -106,3 +106,10 @@ PC ローカルサーバーを起動していない場合でも動作し、ポ�
 - `offscreen.html` / `offscreen.js` / `vendor/transformers/`: ブラウザ内ローカル Whisper WASM 実行ワーカー
 - `local-stt/`: Windows 用ローカル `whisper.cpp` サーバーの導入・手動起動用バッチ／PowerShell スクリプト
 - `demo_quiz.html` / `icons/`: ローカル動作確認用クイズと拡張機能アイコン
+
+---
+
+## ライセンス
+
+- 本リポジトリのオリジナルコード・スクリプトは **[CC0 1.0 Universal](LICENSE)**（パブリックドメイン）のもとで提供します。
+- `vendor/transformers/` に同梱しているサードパーティライブラリ（`transformers.min.js`: `@huggingface/transformers` / Apache-2.0、`ort-wasm-simd-threaded.asyncify.*`: `onnxruntime-web` / MIT）および利用時にダウンロードされる Whisper モデル群には、それぞれの提供元ライセンスが適用されます。
