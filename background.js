@@ -286,6 +286,13 @@ async function handleLessonCompletionTransition(
   logTag = "DONE",
   customPhase = ""
 ) {
+  if (frameData?.siteType === "cle" || isCleUrl(frameData?.url)) {
+    session.phase = "✅ CLE: このページの設問はすべて入力済みです（確認して「提出」を押してください）";
+    session.lastAnswerSummary = "入力完了（自動提出・ページ移動しません）";
+    appendLog(session, `${logTag} CLE: 自動ページ遷移・自動提出を抑止して停止`);
+    await broadcastStatus(tabId);
+    return { done: true };
+  }
   const courseUrl = deriveCourseUrl(frameData.url, session.courseHomeUrl);
   if (isAutoMode && !frameData.isCourseDashboard && courseUrl) {
     resetPerLessonState(session);
@@ -2442,6 +2449,9 @@ function buildPrompts(frameData, settings, alreadyAnsweredCurrentQuestion, allow
 
   // Place static context first so DeepSeek/OpenAI prefix caching reuses shared passage & transcript tokens across Q1..Qn!
   const userSections = [];
+  if (frameData.siteType === "cle" && frameData.cleCourseHeading) {
+    userSections.push(`[科目・テスト名]\n${frameData.cleCourseHeading}`);
+  }
   if (settings.customPrompt) {
     userSections.push(`[指示]\n${settings.customPrompt}`);
   }

@@ -126,12 +126,14 @@
   }
 
   function findContinueButton() {
-    const byAnalytics = document.querySelector(
-      'button[analytics-id="components.directives.attempt-canvas.continue-to-next-page"], button[data-analytics-id="components.directives.attempt-canvas.continue-to-next-page"]'
+    const byAnalytics = Array.from(
+      document.querySelectorAll(
+        'button[analytics-id="components.directives.attempt-canvas.continue-to-next-page"], button[data-analytics-id="components.directives.attempt-canvas.continue-to-next-page"]'
+      )
     );
-    if (byAnalytics && !byAnalytics.disabled && isVisible(byAnalytics)) {
-      return byAnalytics;
-    }
+    const visAnalytics = byAnalytics.find((b) => !b.disabled && isVisible(b));
+    if (visAnalytics) return visAnalytics;
+
     const candidates = Array.from(document.querySelectorAll("button")).filter((b) => {
       if (b.disabled || !isVisible(b)) return false;
       const t = normalizeText(b.innerText || b.textContent);
@@ -141,11 +143,12 @@
   }
 
   function findFooterSubmitButton() {
-    return (
-      document.querySelector(
+    const candidates = Array.from(
+      document.querySelectorAll(
         '.js-send-draft-button, button[analytics-id="course.content.assessment.footer.buttons.submit"]'
-      ) || null
+      )
     );
+    return candidates.find(isVisible) || candidates[0] || null;
   }
 
   function detectOpenDialogPause() {
@@ -573,9 +576,15 @@
     const qCardEls = Array.from(document.querySelectorAll(".assessment-question")).filter(isVisible);
     const continueBtn = findContinueButton();
     const submitBtn = findFooterSubmitButton();
+    const allAnalyzed = qCardEls.map((el, i) => analyzeQuestionCard(el, i));
+    const presentationCards = allAnalyzed.filter((q) => q.status === "locked" && q.statusReason === "no_controls");
+    const analyzed = allAnalyzed.filter((q) => !(q.status === "locked" && q.statusReason === "no_controls"));
 
-    // Intro screen ("問題 0" before "問題 1")
-    if (qCardEls.length === 0) {
+    const courseHeadingEl = Array.from(document.querySelectorAll("h1")).find((h) => isVisible(h));
+    const cleCourseHeading = normalizeText(courseHeadingEl?.innerText || courseHeadingEl?.textContent || "").slice(0, 140);
+
+    // Intro screen ("問題 0" before "問題 1", or no interactive questions rendered yet)
+    if (analyzed.length === 0) {
       const btns = [];
       if (continueBtn) {
         elementRegistry.set("btn-0", continueBtn);
@@ -588,13 +597,13 @@
       }
       return {
         ...baseEmpty,
+        cleCourseHeading,
         hasQuizKeywords: btns.length > 0,
         buttons: btns,
         stateHash: simpleHash(url + "::intro::" + btns.length)
       };
     }
 
-    const analyzed = qCardEls.map((el, i) => analyzeQuestionCard(el, i));
     const activeCards = analyzed.filter((q) => q.status === "active");
     const answeredCards = analyzed.filter((q) => q.status === "answered");
     const lockedCards = analyzed.filter((q) => q.status === "locked");
@@ -617,53 +626,59 @@
     const hasAutosaveDirty = Boolean(
       document.querySelector('form[name="questionForm"].ng-dirty')
     );
+    const autosaveBusy = Boolean(answeredCards.length > 0 && (submitDisabled || hasAutosaveDirty));
 
-    // All questions on this page are answered
+    // All interactive questions on this page are already answered
     if (activeCards.length === 0) {
-      if (continueBtn) {
-        // If user/extension already answered all questions on this page and autosave is actively flushing, hold cleanly
-        const cleWaitingAutosave = Boolean(
-          answeredCards.length > 0 && (submitDisabled || hasAutosaveDirty)
-        );
-        const btns = [];
-        if (!cleWaitingAutosave) {
-          elementRegistry.set("btn-0", continueBtn);
-          btns.push({
-            id: "btn-0",
-            text: normalizeText(continueBtn.innerText || continueBtn.textContent || "続行"),
-            kind: "next",
-            belongsToActiveQuestion: false
-          });
-        }
+      if (autosaveBusy) {
         return {
           ...baseEmpty,
+          cleCourseHeading,
           questionSummary,
           blocksSummary,
           hasQuizKeywords: true,
-          cleWaitingAutosave,
-          buttons: btns,
-          stateHash: simpleHash(
-            url + "::done-page::" + answeredCards.length + "::wait=" + cleWaitingAutosave
-          )
+          cleWaitingAutosave: true,
+          buttons: [],
+          stateHash: simpleHash(url + "::autosave-wait::" + answeredCards.length)
         };
       }
 
-      if (submitBtn && isVisible(submitBtn)) {
+      if (continueBtn) {
+        elementRegistry.set("btn-0", continueBtn);
         return {
           ...baseEmpty,
+          cleCourseHeading,
           questionSummary,
           blocksSummary,
           hasQuizKeywords: true,
-          clePauseReason: "ready_to_submit",
-          clePauseMessage: "✅ CLE: 全問の解答入力が完了しました（確認して「提出」を押してください）",
-          clePauseDetail:
-            "誤提出防止のため自動提出しません。入力内容を確認し、問題なければ画面右下の「提出」を押してください。"
+          cleWaitingAutosave: false,
+          buttons: [
+            {
+              id: "btn-0",
+              text: normalizeText(continueBtn.innerText || continueBtn.textContent || "続行"),
+              kind: "next",
+              belongsToActiveQuestion: false
+            }
+          ],
+          stateHash: simpleHash(url + "::done-page::" + answeredCards.length)
         };
       }
+
+      return {
+        ...baseEmpty,
+        cleCourseHeading,
+        questionSummary,
+        blocksSummary,
+        hasQuizKeywords: true,
+        clePauseReason: "ready_to_submit",
+        clePauseMessage: "✅ CLE: 全問の解答入力が完了しました（確認して「提出」を押してください）",
+        clePauseDetail:
+          "誤提出防止のため自動提出しません。入力内容を確認し、問題なければ画面右下の「提出」を押してください。"
+      };
     }
 
-    const target = activeCards[0] || analyzed[0];
-    const targetIdx = analyzed.indexOf(target);
+    const target = activeCards[0];
+    const targetIdx = allAnalyzed.indexOf(target);
 
     // Register interactive controls ONLY for the single target question
     const mappedOptions = target.options.map((o, idx) => {
@@ -709,11 +724,17 @@
 
     if (targetIdx > 0 && shouldInheritFromPreceding) {
       for (let j = targetIdx - 1; j >= Math.max(0, targetIdx - 8); j--) {
-        const prev = analyzed[j];
+        const prev = allAnalyzed[j];
+        if (!prev) continue;
         const dist = targetIdx - j + 1;
         const withinExplicitSpan = prev.groupSpan > 0 && dist <= prev.groupSpan;
+        const isPresentationPassage =
+          prev.status === "locked" &&
+          prev.statusReason === "no_controls" &&
+          !/画面下部の「続行」|問題は全部で/.test(prev.questionText);
         const looksGrouped =
           withinExplicitSpan ||
+          isPresentationPassage ||
           Boolean(
             target.subQuestionHint &&
               target.subQuestionHint.num >= 2 &&
@@ -723,7 +744,7 @@
 
         if (!looksGrouped) continue;
         if (!resolvedAudioUrl && prev.audioUrl) resolvedAudioUrl = prev.audioUrl;
-        if (prev.hasPassageBlock) {
+        if (prev.hasPassageBlock || isPresentationPassage) {
           const header = extractContextHeaderFromCardText(prev.questionText);
           if (header) sharedContext = header;
         }
@@ -732,7 +753,7 @@
     }
 
     const allPageAudioUrls = Array.from(
-      new Set(analyzed.map((q) => q.audioUrl).filter(Boolean))
+      new Set(allAnalyzed.map((q) => q.audioUrl).filter(Boolean))
     );
 
     const cleOwnPassage = target.hasPassageBlock
@@ -752,6 +773,7 @@
 
     const result = {
       ...baseEmpty,
+      cleCourseHeading,
       sharedContext,
       activeQuestionId: target.qId,
       activeQuestionText: target.questionText,
