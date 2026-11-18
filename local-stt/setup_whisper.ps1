@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $rootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -22,12 +22,12 @@ function Download-FileFast([string]$url, [string]$destPath) {
     }
     Write-Host "PowerShell でダウンロード中: $url"
     $wc = New-Object System.Net.WebClient
-    $wc.Headers.Add("User-Agent", "E-Learning-Killer-Setup")
+    $wc.Headers.Add("User-Agent", "e-learning-killer-setup")
     $wc.DownloadFile($url, $destPath)
 }
 
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host " E-Learning Killer ローカルWhisper 初回セットアップ" -ForegroundColor Cyan
+Write-Host " e-learning Killer ローカルWhisper 初回セットアップ" -ForegroundColor Cyan
 Write-Host " (Windows自動起動への登録は一切行いません)" -ForegroundColor DarkGray
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
@@ -45,7 +45,7 @@ if ($needBin) {
     Write-Host "[1/2] ggml-org/whisper.cpp の最新 Windows バイナリを確認中..." -ForegroundColor Yellow
     $zipUrl = $null
     try {
-        $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=15" -Headers @{ "User-Agent" = "E-Learning-Killer-Setup" }
+        $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=15" -Headers @{ "User-Agent" = "e-learning-killer-setup" }
         foreach ($rel in $releases) {
             if (-not $rel.assets) { continue }
             $asset = $rel.assets | Where-Object { $_.name -eq "whisper-bin-x64.zip" } | Select-Object -First 1

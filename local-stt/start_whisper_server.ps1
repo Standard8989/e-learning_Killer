@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $rootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $binDir = Join-Path $rootDir "bin"
@@ -39,7 +39,7 @@ $threads = [Math]::Max(2, [Math]::Min(8, [Environment]::ProcessorCount))
 $lang = if ($modelPath -match "\.en\.bin$") { "en" } else { "auto" }
 
 Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host " E-Learning Killer ローカル音声サーバー起動中" -ForegroundColor Cyan
+Write-Host " e-learning Killer ローカル音声サーバー起動中" -ForegroundColor Cyan
 Write-Host " 実行ファイル : $serverExe"
 Write-Host " 使用モデル   : $(Split-Path -Leaf $modelPath) (lang=$lang, threads=$threads)"
 Write-Host " URL          : http://127.0.0.1:8765/inference" -ForegroundColor Green

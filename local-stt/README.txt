@@ -1,4 +1,4 @@
-=== E-Learning Killer PCローカルWhisperサーバー ===
+=== e-learning Killer PCローカルWhisperサーバー ===
 
 このフォルダ内のバッチファイルを使うと、PC上で高精度な Whisper (whisper.cpp) を
 完全ローカル（API制限なし・無料・高速）で動かすことができます。

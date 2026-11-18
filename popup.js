@@ -1,4 +1,4 @@
-// popup.js - E-Learning Killer Popup Controller (with Live Debug & DOM Diagnostic Export)
+// popup.js - e-learning Killer Popup Controller (with Live Debug & DOM Diagnostic Export)
 
 document.addEventListener("DOMContentLoaded", async () => {
   const statusDot = document.getElementById("statusDot");

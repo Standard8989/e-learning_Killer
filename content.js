@@ -1,4 +1,4 @@
-// content.js - E-Learning Killer DOM Analyzer, Action Executor, HUD & Live Debugger
+// content.js - e-learning Killer DOM Analyzer, Action Executor, HUD & Live Debugger
 
 (() => {
   // ==========================================================================
@@ -4194,7 +4194,7 @@
         <div class="header" id="dragHandle">
           <div class="brand">
             <span class="dot" id="statusDot"></span>
-            <span>E-Learning Killer</span>
+            <span>e-learning Killer</span>
           </div>
           <div class="header-btns">
             <span class="badge" id="countBadge">0問</span>

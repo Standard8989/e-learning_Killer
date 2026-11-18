@@ -1,4 +1,4 @@
-// background.js - E-Learning Killer Service Worker (MV3) with Live Debug Logger & DOM Report
+// background.js - e-learning Killer Service Worker (MV3) with Live Debug Logger & DOM Report
 
 const PRESETS = {
   deepseek: {
@@ -2864,7 +2864,7 @@ async function buildDebugReport(tabId) {
     recentLogs: session.logs.slice(-50)
   };
 
-  return "=== E-Learning Killer Diagnostic Report ===\n" + JSON.stringify(reportObj, null, 2);
+  return "=== e-learning Killer Diagnostic Report ===\n" + JSON.stringify(reportObj, null, 2);
 }
 
 async function startAutoLoop(tabId) {

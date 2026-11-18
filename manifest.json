@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "E-Learning Killer - AI自動解答アシスタント",
+  "name": "e-learning Killer - AI自動解答アシスタント",
   "version": "1.0.0",
   "description": "ブラウザ上の選択式クイズ・eラーニング問題をAI（DeepSeek / OpenAI / Gemini / Claude等）＋ローカルWhisper音声認識で自動解析・全自動解答します。",
   "permissions": [
@@ -31,7 +31,7 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "E-Learning Killer",
+    "default_title": "e-learning Killer",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
